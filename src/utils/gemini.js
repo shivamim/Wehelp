@@ -67,9 +67,43 @@ let systemAudioProc = null;
 let messageBuffer = '';
 let groqRequestStartedForTurn = false;
 
-const GROQ_MAX_COMPLETION_TOKENS = 16384;
+const GROQ_DEFAULT_OUTPUT_TOKENS = 1024; // concise answers; raised only when a reply is truncated
+const GROQ_EXTENDED_OUTPUT_TOKENS = 4096; // retry budget for genuinely long answers
+const GROQ_MAX_OUTPUT_TOKENS_CEILING = 16384; // hard cap on the configured value
 const GROQ_EMPTY_RESPONSE_MESSAGE =
     'Groq reached the maximum completion-token limit before returning a final answer. Disable thinking in Home → AI responses and try again.';
+
+// Main-process code cannot import storage.js (circular dependency), so index.js
+// injects a config getter at startup via setRuntimeConfigGetter().
+let _runtimeConfigGetter = null;
+function setRuntimeConfigGetter(getter) {
+    _runtimeConfigGetter = typeof getter === 'function' ? getter : null;
+}
+
+function getRuntimeConfig() {
+    if (_runtimeConfigGetter) {
+        try {
+            return _runtimeConfigGetter() || {};
+        } catch {
+            return {};
+        }
+    }
+    return {};
+}
+
+/**
+ * Configurable per-request output budget. Defaults to 1024 tokens — a ceiling,
+ * not a quota: models stop as soon as the answer is done. `override` lets a
+ * retry pass use a larger budget after a truncation.
+ */
+function getGroqOutputTokenBudget(override) {
+    const candidates = [override, getRuntimeConfig().groqMaxOutputTokens, GROQ_DEFAULT_OUTPUT_TOKENS];
+    for (const candidate of candidates) {
+        const n = Number(candidate);
+        if (Number.isFinite(n) && n >= 128) return Math.min(Math.floor(n), GROQ_MAX_OUTPUT_TOKENS_CEILING);
+    }
+    return GROQ_DEFAULT_OUTPUT_TOKENS;
+}
 
 // Reconnection variables
 let isUserClosing = false;
@@ -438,8 +472,12 @@ async function sendToGroq(transcription) {
         groqConversationHistory = groqConversationHistory.slice(-20);
     }
 
-    const streamId = 'groq-text';
-    try {
+    // One streamed Groq text request. Resolves with:
+    //   { status: 'ok', cleanedResponse }      — final answer displayed & saved
+    //   { status: 'truncated', rawText, ... }  — hit the token ceiling with no answer
+    //   { status: 'empty' }                    — model produced nothing usable
+    //   { status: 'http_error' }               — error already reported to the UI
+    async function runRequest(tokenBudget) {
         const response = await fetchWithRetry(
             'https://api.groq.com/openai/v1/chat/completions',
             {
@@ -453,7 +491,7 @@ async function sendToGroq(transcription) {
                     messages: [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...groqConversationHistory],
                     stream: true,
                     temperature: 0.7,
-                    max_completion_tokens: GROQ_MAX_COMPLETION_TOKENS,
+                    max_completion_tokens: tokenBudget,
                     ...getGroqReasoningOptions(modelToUse, config.disableGroqThinking),
                 }),
             },
@@ -464,7 +502,7 @@ async function sendToGroq(transcription) {
             const errorText = await response.text().catch(() => '');
             logTransportEvent('groq.text.http_error', { status: response.status, body: errorText });
             reportApiError('groq', response.status, errorText);
-            return;
+            return { status: 'http_error' };
         }
 
         logTransportEvent('groq.text.http_response', { status: response.status });
@@ -498,20 +536,41 @@ async function sendToGroq(transcription) {
             });
 
             saveConversationTurn(transcription, cleanedResponse);
-        } else {
-            console.warn(`Groq returned no final answer (${modelToUse})`);
-            logTransportEvent('groq.text.empty_response', { model: modelToUse, fullText, finishReason });
-            sendToRenderer('new-response', GROQ_EMPTY_RESPONSE_MESSAGE);
-            sendToRenderer('update-status', 'Groq reached the completion-token limit');
-            return;
+
+            logTransportEvent('groq.text.completed', {
+                model: modelToUse,
+                response: cleanedResponse,
+            });
+            console.log(`Groq response completed (${modelToUse})`);
+            sendToRenderer('update-status', 'Listening...');
+            return { status: 'ok', cleanedResponse };
         }
 
-        logTransportEvent('groq.text.completed', {
-            model: modelToUse,
-            response: cleanedResponse,
-        });
-        console.log(`Groq response completed (${modelToUse})`);
-        sendToRenderer('update-status', 'Listening...');
+        if (finishReason === 'length') return { status: 'truncated', rawText: fullText, finishReason };
+        return { status: 'empty', rawText: fullText, finishReason };
+    }
+
+    try {
+        let tokenBudget = getGroqOutputTokenBudget();
+        let result = await runRequest(tokenBudget);
+
+        if (result.status === 'truncated' && tokenBudget < GROQ_EXTENDED_OUTPUT_TOKENS) {
+            // The answer hit its token ceiling mid-sentence — retry once with a
+            // larger budget instead of showing a clipped reply.
+            console.warn(`Groq answer truncated at ${tokenBudget} tokens; retrying with ${GROQ_EXTENDED_OUTPUT_TOKENS}`);
+            logTransportEvent('groq.text.truncated_retry', { model: modelToUse, tokenBudget });
+            tokenBudget = GROQ_EXTENDED_OUTPUT_TOKENS;
+            result = await runRequest(tokenBudget);
+        }
+
+        if (result.status === 'http_error') return;
+
+        if (result.status !== 'ok') {
+            console.warn(`Groq returned no final answer (${modelToUse})`);
+            logTransportEvent('groq.text.empty_response', { model: modelToUse, fullText: result.rawText, finishReason: result.finishReason });
+            sendToRenderer('new-response', GROQ_EMPTY_RESPONSE_MESSAGE);
+            sendToRenderer('update-status', 'Groq reached the completion-token limit');
+        }
     } catch (error) {
         finalizeStream(streamId, null);
         console.error('Error calling Groq API:', error);
