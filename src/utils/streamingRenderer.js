@@ -232,6 +232,7 @@
             const html = this.renderMarkdown(block.text);
             if (html == null) return;
             block.el.innerHTML = html;
+            block.el.classList.add('markdown-rendered');
             block.renderedHtml = null; // next token falls back to plain-append path
         }
 
@@ -240,6 +241,7 @@
             if (this.renderMarkdown && block.text.trim()) {
                 this._renderBlockMarkdown(block);
             } else {
+                block.el.classList.remove('markdown-rendered');
                 block.el.textContent = block.text;
                 block.renderedHtml = block.text;
             }

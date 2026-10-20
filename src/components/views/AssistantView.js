@@ -1,4 +1,5 @@
 import { html, css, LitElement } from '../../assets/lit-core-2.7.4.min.js';
+import StreamingMarkdownRenderer from '../../utils/streamingRenderer.js';
 
 export class AssistantView extends LitElement {
     static styles = css`
@@ -328,6 +329,17 @@ export class AssistantView extends LitElement {
         this.onSendText = () => {};
         this.isAnalyzing = false;
         this._animFrame = null;
+
+        // Incremental streaming renderer: appends new text in place, throttles
+        // paints to one per animation frame and only re-parses Markdown on a
+        // debounce — instead of rebuilding the whole answer on every token.
+        this._streamRenderer = new StreamingMarkdownRenderer(null, {
+            renderMarkdown: content => this.renderMarkdown(content),
+        });
+        this._lastRenderedResponseCount = 0;
+        this._lastRenderedIndex = -1;
+        this._lastRenderedText = null;
+        this._isStreamingResponse = false;
     }
 
     getProfileNames() {
@@ -446,16 +458,35 @@ export class AssistantView extends LitElement {
             this.handleScrollUp = () => this.scrollResponseUp();
             this.handleScrollDown = () => this.scrollResponseDown();
 
+            // Track "Listening..." transitions so a finished stream gets its
+            // one-time Markdown render even when no further text arrives.
+            this.handleStatusUpdate = (_, status) => {
+                if (typeof status === 'string' && (status.includes('Listening') || status.includes('Ready'))) {
+                    if (!this._sessionListening) {
+                        this._sessionListening = true;
+                        this.updateResponseContent();
+                    }
+                } else {
+                    this._sessionListening = false;
+                }
+            };
+
             ipcRenderer.on('navigate-previous-response', this.handlePreviousResponse);
             ipcRenderer.on('navigate-next-response', this.handleNextResponse);
             ipcRenderer.on('scroll-response-up', this.handleScrollUp);
             ipcRenderer.on('scroll-response-down', this.handleScrollDown);
+            ipcRenderer.on('update-status', this.handleStatusUpdate);
         }
     }
 
     disconnectedCallback() {
         super.disconnectedCallback();
         this._stopWaveformAnimation();
+        this._streamRenderer.clear();
+        this._streamRenderer.container = null;
+        this._lastRenderedText = null;
+        this._lastRenderedIndex = -1;
+        this._lastRenderedResponseCount = 0;
 
         if (window.require) {
             const { ipcRenderer } = window.require('electron');
@@ -463,6 +494,7 @@ export class AssistantView extends LitElement {
             if (this.handleNextResponse) ipcRenderer.removeListener('navigate-next-response', this.handleNextResponse);
             if (this.handleScrollUp) ipcRenderer.removeListener('scroll-response-up', this.handleScrollUp);
             if (this.handleScrollDown) ipcRenderer.removeListener('scroll-response-down', this.handleScrollDown);
+            if (this.handleStatusUpdate) ipcRenderer.removeListener('update-status', this.handleStatusUpdate);
         }
     }
 
@@ -639,6 +671,10 @@ export class AssistantView extends LitElement {
 
     firstUpdated() {
         super.firstUpdated();
+        // Point the streaming renderer at the persistent response container.
+        // Lit never re-renders this element's children (static template), so
+        // the blocks below survive every update instead of being rebuilt.
+        this._streamRenderer.container = this.shadowRoot.querySelector('#responseContainer');
         this.updateResponseContent();
     }
 
@@ -663,15 +699,57 @@ export class AssistantView extends LitElement {
         }
     }
 
+    /**
+     * True while a streamed answer is still growing — i.e. the last response
+     * was appended/replaced without ever shrinking, no newer response arrived,
+     * and the session hasn't reported "Listening" since it started.
+     */
+    _lastResponseIsStreaming() {
+        const count = this.responses.length;
+        if (count === 0) return false;
+        const text = this.responses[count - 1];
+        if (typeof text !== 'string') return false;
+        if (count !== this._lastRenderedResponseCount + 1 && count !== this._lastRenderedResponseCount) return false;
+        if (this._lastRenderedText != null && text.length < this._lastRenderedText.length) return false;
+        return !this._sessionListening;
+    }
+
     updateResponseContent() {
-        const container = this.shadowRoot.querySelector('#responseContainer');
-        if (container) {
-            const currentResponse = this.getCurrentResponse();
-            const renderedResponse = this.renderMarkdown(currentResponse);
-            container.innerHTML = renderedResponse;
-            if (this.shouldAnimateResponse) {
-                this.dispatchEvent(new CustomEvent('response-animation-complete', { bubbles: true, composed: true }));
+        const renderer = this._streamRenderer;
+        if (!renderer.container) return;
+
+        const count = this.responses.length;
+        const index = this.currentResponseIndex;
+        const text = this.getCurrentResponse();
+        renderer.trimTo(count);
+
+        const isNewResponse = count !== this._lastRenderedResponseCount || index !== this._lastRenderedIndex;
+        const sameText = !isNewResponse && text === this._lastRenderedText;
+
+        if (!sameText) {
+            renderer.setActive(index >= 0 ? index : 0);
+            if (this._lastResponseIsStreaming()) {
+                // Mid-stream snapshot: append only the new characters, repaint
+                // at most once per frame, Markdown upgrade stays debounced.
+                this._isStreamingResponse = true;
+                renderer.update(text);
+            } else {
+                // Completed (or placeholder) answer: parse Markdown exactly once.
+                if (this._isStreamingResponse) {
+                    renderer.finalize(text);
+                    this._isStreamingResponse = false;
+                } else {
+                    renderer.renderFinalAt(index >= 0 ? index : 0, text);
+                }
             }
+        }
+
+        this._lastRenderedResponseCount = count;
+        this._lastRenderedIndex = index;
+        this._lastRenderedText = text;
+
+        if (this.shouldAnimateResponse) {
+            this.dispatchEvent(new CustomEvent('response-animation-complete', { bubbles: true, composed: true }));
         }
     }
 
