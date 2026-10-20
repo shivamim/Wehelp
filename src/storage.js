@@ -4,12 +4,49 @@ const os = require('os');
 
 const CONFIG_VERSION = 1;
 
+// ── Gemini model catalog ─────────────────────────────────────────────────────
+// Keep this list ordered fastest-first — the UI dropdown and the migration
+// logic below both rely on that ordering.
+const GEMINI_LIVE_MODELS = [
+    // Current-gen Live API models (audio in / audio+text out).
+    'gemini-3.1-flash-live-preview', // default: best latency/quality balance
+    'gemini-3-flash-live-preview',
+    'gemini-3.1-pro-live-preview', // highest quality, slightly slower
+    'gemini-2.5-flash-native-audio-preview-12-2025',
+    'gemini-2.5-flash-preview-tts',
+    // Previous generation — still supported, kept for fallback.
+    'gemini-2.5-flash-live-preview',
+    'gemini-2.0-flash-live-0125',
+];
+
+const GEMINI_CHAT_MODELS = [
+    // Text/vision models used for screen analysis + answers.
+    'gemini-3-flash', // fast, strong vision — great for screenshots
+    'gemini-3.1-flash-lite', // cheapest / lowest latency
+    'gemini-3-pro', // highest quality
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
+    'gemini-2.5-pro',
+];
+
+// Retired/renamed model ids → modern equivalents. Applied when loading config
+// so users with old saved values never hit "model not found" errors.
+const LEGACY_GEMINI_MODEL_MAP = {
+    'gemini-2.0-flash-live-preview-04-09': 'gemini-2.0-flash-live-0125',
+    'gemini-2.5-flash-preview-tts': 'gemini-2.5-flash-native-audio-preview-12-2025',
+    'gemini-live-2.5-flash-native-audio': 'gemini-2.5-flash-native-audio-preview-12-2025',
+    'gemini-flash-latest': 'gemini-3-flash',
+    'gemini-flash-lite-latest': 'gemini-3.1-flash-lite',
+    'gemini-pro-latest': 'gemini-3-pro',
+};
+
 // Default values
 const DEFAULT_CONFIG = {
     configVersion: CONFIG_VERSION,
     onboarded: false,
     layout: 'normal',
     geminiLiveModel: 'gemini-3.1-flash-live-preview',
+    geminiChatModel: 'gemini-3-flash',
     groqModel: 'qwen/qwen3.6-27b',
     groqImageModel: 'qwen/qwen3.6-27b',
     disableGroqThinking: true,
@@ -145,6 +182,7 @@ function resetConfigDir() {
     writeJsonFile(getConfigPath(), DEFAULT_CONFIG);
     writeJsonFile(getCredentialsPath(), DEFAULT_CREDENTIALS);
     writeJsonFile(getPreferencesPath(), DEFAULT_PREFERENCES);
+    invalidateConfigCache();
 
     console.log('Config directory initialized with defaults');
 }
@@ -164,20 +202,61 @@ function initializeStorage() {
 
 // ============ CONFIG ============
 
+// In-memory cache so hot paths (every AI call) never touch the disk.
+let configCache = null;
+let configNeedsPersist = false;
+
+function _migrateGeminiModels(config) {
+    let changed = false;
+    for (const key of ['geminiLiveModel', 'geminiChatModel']) {
+        const value = config[key];
+        if (typeof value !== 'string' || !value.trim()) {
+            config[key] = DEFAULT_CONFIG[key];
+            changed = true;
+            continue;
+        }
+        const mapped = LEGACY_GEMINI_MODEL_MAP[value];
+        if (mapped) {
+            config[key] = mapped;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 function getConfig() {
+    if (configCache) return configCache;
     const saved = readJsonFile(getConfigPath(), {});
-    return { ...DEFAULT_CONFIG, ...saved };
+    const config = { ...DEFAULT_CONFIG, ...saved };
+    if (_migrateGeminiModels(config)) {
+        // Persist migrated model ids once so we don't redo the work every boot.
+        configNeedsPersist = true;
+        writeJsonFile(getConfigPath(), config);
+        configNeedsPersist = false;
+    }
+    configCache = config;
+    return configCache;
+}
+
+function invalidateConfigCache() {
+    configCache = null;
 }
 
 function setConfig(config) {
     const current = getConfig();
     const updated = { ...current, ...config, configVersion: CONFIG_VERSION };
+    _migrateGeminiModels(updated);
+    configCache = updated;
     return writeJsonFile(getConfigPath(), updated);
 }
 
 function updateConfig(key, value) {
-    const config = getConfig();
+    const config = { ...getConfig() };
     config[key] = value;
+    if (key === 'geminiLiveModel' || key === 'geminiChatModel') {
+        _migrateGeminiModels(config);
+    }
+    configCache = config;
     return writeJsonFile(getConfigPath(), config);
 }
 
@@ -366,16 +445,13 @@ function getTodayLimits() {
             };
         }
         if (!todayEntry.gemini) {
-            todayEntry.gemini = {
-                'gemma-4-26b-a4b-it': { chars: 0 },
-            };
+            todayEntry.gemini = {};
         }
-        setLimits(limits);
         return todayEntry;
     }
 
     // No entry for today - clean old entries and create new one
-    limits.data = limits.data.filter(entry => entry.date === today);
+    limits.data = [];
     const newEntry = {
         date: today,
         flash: { count: 0 },
@@ -386,9 +462,7 @@ function getTodayLimits() {
             'gpt-oss-20b': { chars: 0, limit: 600000 },
             'kimi-k2-instruct': { chars: 0, limit: 600000 },
         },
-        gemini: {
-            'gemma-4-26b-a4b-it': { chars: 0 },
-        },
+        gemini: {},
     };
     limits.data.push(newEntry);
     setLimits(limits);
@@ -404,24 +478,22 @@ function incrementLimitCount(model) {
     let todayEntry = limits.data.find(entry => entry.date === today);
 
     if (!todayEntry) {
-        // Clean old entries and create new one
-        limits.data = [];
-        todayEntry = {
-            date: today,
-            flash: { count: 0 },
-            flashLite: { count: 0 },
-        };
-        limits.data.push(todayEntry);
-    } else {
-        // Clean old entries, keep only today
-        limits.data = limits.data.filter(entry => entry.date === today);
+        todayEntry = getTodayLimits();
     }
 
-    // Increment the appropriate model count
-    if (model === 'gemini-2.5-flash') {
-        todayEntry.flash.count++;
-    } else if (model === 'gemini-2.5-flash-lite') {
-        todayEntry.flashLite.count++;
+    // Increment the appropriate model counter (create on demand so new model
+    // ids never crash on a missing counter object).
+    const countersByModel = {
+        'gemini-2.5-flash': 'flash',
+        'gemini-2.5-flash-lite': 'flashLite',
+        'gemini-3-flash': 'chat',
+        'gemini-3.1-flash-lite': 'chatLite',
+        'gemini-3-pro': 'pro',
+    };
+    const key = countersByModel[model];
+    if (key) {
+        if (!todayEntry[key]) todayEntry[key] = { count: 0 };
+        todayEntry[key].count++;
     }
 
     setLimits(limits);
@@ -429,32 +501,46 @@ function incrementLimitCount(model) {
 }
 
 function incrementCharUsage(provider, model, charCount) {
-    getTodayLimits();
+    const todayEntry = getTodayLimits();
 
-    const limits = getLimits();
-    const today = getTodayDateString();
-    const todayEntry = limits.data.find(entry => entry.date === today);
+    if (!Number.isFinite(charCount) || charCount <= 0) return todayEntry;
 
-    if (todayEntry[provider] && todayEntry[provider][model]) {
-        todayEntry[provider][model].chars += charCount;
-        setLimits(limits);
-    }
+    if (!todayEntry[provider]) todayEntry[provider] = {};
+    if (!todayEntry[provider][model]) todayEntry[provider][model] = { chars: 0, limit: 1500000 };
+    todayEntry[provider][model].chars += charCount;
+    setLimits(getLimits());
 
     return todayEntry;
 }
 
+// Pick the fastest healthy Gemini chat/vision model based on daily quotas.
+// Free-tier RPD budget is per model — rotating when one runs out keeps calls
+// flowing instead of stalling on 429 backoff.
 function getAvailableModel() {
-    const todayLimits = getTodayLimits();
+    const config = getConfig();
+    const preferred = typeof config.geminiChatModel === 'string' && config.geminiChatModel.trim() ? config.geminiChatModel.trim() : DEFAULT_CONFIG.geminiChatModel;
 
-    // RPD limits: flash = 20, flash-lite = 20
-    // After both exhausted, fall back to flash (for paid API users)
-    if (todayLimits.flash.count < 20) {
-        return 'gemini-2.5-flash';
-    } else if (todayLimits.flashLite.count < 20) {
-        return 'gemini-2.5-flash-lite';
+    const rotation = [preferred, ...GEMINI_CHAT_MODELS.filter(m => m !== preferred)];
+    const todayEntry = getTodayLimits();
+    const gemini = todayEntry.gemini || {};
+
+    const FREE_TIER_RPD = 30; // conservative floor across tiers
+    for (const model of rotation) {
+        const used = gemini[model]?.requestsToday || 0;
+        if (used < FREE_TIER_RPD) return model;
     }
 
-    return 'gemini-2.5-flash'; // Default to flash for paid API users
+    // All quotas exhausted — paid tier still works on the preferred model.
+    return preferred;
+}
+
+function recordModelRequest(model) {
+    const todayEntry = getTodayLimits();
+    if (!todayEntry.gemini) todayEntry.gemini = {};
+    if (!todayEntry.gemini[model]) todayEntry.gemini[model] = { chars: 0, requestsToday: 0 };
+    if (todayEntry.gemini[model].requestsToday === undefined) todayEntry.gemini[model].requestsToday = 0;
+    todayEntry.gemini[model].requestsToday++;
+    setLimits(getLimits());
 }
 
 function getModelForToday() {
@@ -592,6 +678,9 @@ module.exports = {
     getConfig,
     setConfig,
     updateConfig,
+    invalidateConfigCache,
+    GEMINI_LIVE_MODELS,
+    GEMINI_CHAT_MODELS,
 
     setApiKeyManager,
 
@@ -619,6 +708,7 @@ module.exports = {
     getTodayLimits,
     incrementLimitCount,
     getAvailableModel,
+    recordModelRequest,
     incrementCharUsage,
     getModelForToday,
 

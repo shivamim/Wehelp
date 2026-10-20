@@ -105,6 +105,22 @@ const STREAM_FLUSH_INTERVAL_MS = 50;
 const pendingStreamText = new Map(); // id -> accumulated full text
 const streamFlushTimers = new Map(); // id -> timer handle
 
+// ── GoogleGenAI client cache ─────────────────────────────────────────────────
+// Constructing a client per request is cheap-ish but wasteful; reuse one per
+// API key (bounded to avoid leaks when keys rotate).
+const genaiClients = new Map();
+
+function getGenaiClient(apiKey, options = {}) {
+    const cacheKey = `${apiKey}|${options.vertexai ? 'v' : 'g'}|${options.httpOptions?.apiVersion || ''}`;
+    let client = genaiClients.get(cacheKey);
+    if (!client) {
+        client = new GoogleGenAI({ apiKey, ...options });
+        if (genaiClients.size > 8) genaiClients.clear();
+        genaiClients.set(cacheKey, client);
+    }
+    return client;
+}
+
 function emitStreamText(id, fullText) {
     pendingStreamText.set(id, fullText);
     if (!streamFlushTimers.has(id)) {
@@ -252,48 +268,42 @@ async function getEnabledTools() {
 
     // Check if Google Search is enabled (default: true)
     const googleSearchEnabled = await getStoredSetting('googleSearchEnabled', 'true');
-    console.log('Google Search enabled:', googleSearchEnabled);
 
     if (googleSearchEnabled === 'true') {
         tools.push({ googleSearch: {} });
-        console.log('Added Google Search tool');
-    } else {
-        console.log('Google Search tool disabled');
     }
 
     return tools;
 }
 
+// ── Renderer localStorage settings with cache ────────────────────────────────
+// executeJavaScript round-trips are expensive; never do them in a hot path.
+const storedSettingCache = new Map();
+
 async function getStoredSetting(key, defaultValue) {
+    if (storedSettingCache.has(key)) {
+        return storedSettingCache.get(key);
+    }
     try {
         const windows = BrowserWindow.getAllWindows();
         if (windows.length > 0) {
-            // Wait a bit for the renderer to be ready
-            await new Promise(resolve => setTimeout(resolve, 100));
-
-            // Try to get setting from renderer process localStorage
             const value = await windows[0].webContents.executeJavaScript(`
                 (function() {
                     try {
-                        if (typeof localStorage === 'undefined') {
-                            console.log('localStorage not available yet for ${key}');
-                            return '${defaultValue}';
-                        }
-                        const stored = localStorage.getItem('${key}');
-                        console.log('Retrieved setting ${key}:', stored);
-                        return stored || '${defaultValue}';
+                        if (typeof localStorage === 'undefined') return null;
+                        return localStorage.getItem('${key}');
                     } catch (e) {
-                        console.error('Error accessing localStorage for ${key}:', e);
-                        return '${defaultValue}';
+                        return null;
                     }
                 })()
             `);
-            return value;
+            const resolved = value == null ? defaultValue : value;
+            storedSettingCache.set(key, resolved);
+            return resolved;
         }
     } catch (error) {
         console.error('Error getting stored setting for', key, ':', error.message);
     }
-    console.log('Using default value for', key, ':', defaultValue);
     return defaultValue;
 }
 
