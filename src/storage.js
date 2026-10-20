@@ -182,31 +182,85 @@ function updateConfig(key, value) {
 }
 
 // ============ CREDENTIALS ============
+// API keys (apiKey / groqApiKey) live in secure storage (OS keychain or an
+// encrypted file — see src/utils/apiKeys.js). Non-secret credential fields
+// (e.g. cloudToken) remain in credentials.json. The ApiKeyManager is injected
+// at app startup via setApiKeyManager(); until then we transparently fall back
+// to the legacy plaintext file so nothing breaks during boot/migration.
+
+let apiKeyManager = null;
+
+function setApiKeyManager(manager) {
+    apiKeyManager = manager;
+}
+
+function _readLegacySecret(name) {
+    const creds = readJsonFile(getCredentialsPath(), DEFAULT_CREDENTIALS);
+    return name === 'gemini' ? creds.apiKey || '' : creds.groqApiKey || '';
+}
+
+function _writeLegacySecret(name, value) {
+    const current = getCredentials();
+    const updated = { ...current };
+    if (name === 'gemini') updated.apiKey = value;
+    else updated.groqApiKey = value;
+    return writeJsonFile(getCredentialsPath(), updated);
+}
 
 function getCredentials() {
-    return readJsonFile(getCredentialsPath(), DEFAULT_CREDENTIALS);
+    const stored = readJsonFile(getCredentialsPath(), DEFAULT_CREDENTIALS);
+    // Strip secret material from this view; callers get authoritative values
+    // from getApiKey()/getGroqApiKey() (secure store first, legacy fallback).
+    const { apiKey, groqApiKey, ...rest } = stored;
+    return {
+        ...DEFAULT_CREDENTIALS,
+        ...rest,
+        apiKey: getApiKey(),
+        groqApiKey: getGroqApiKey(),
+    };
 }
 
 function setCredentials(credentials) {
-    const current = getCredentials();
-    const updated = { ...current, ...credentials };
+    const updates = { ...credentials };
+
+    // Route key material through the secure manager (with normalization).
+    if ('apiKey' in updates) {
+        setApiKey(updates.apiKey);
+        delete updates.apiKey;
+    }
+    if ('groqApiKey' in updates) {
+        setGroqApiKey(updates.groqApiKey);
+        delete updates.groqApiKey;
+    }
+
+    if (Object.keys(updates).length === 0) return true;
+
+    const current = readJsonFile(getCredentialsPath(), DEFAULT_CREDENTIALS);
+    const updated = { ...current, ...updates };
+    // Never persist secret fields in the plaintext file anymore.
+    delete updated.apiKey;
+    delete updated.groqApiKey;
     return writeJsonFile(getCredentialsPath(), updated);
 }
 
 function getApiKey() {
-    return getCredentials().apiKey || '';
+    if (apiKeyManager) return apiKeyManager.getApiKey();
+    return _readLegacySecret('gemini');
 }
 
 function setApiKey(apiKey) {
-    return setCredentials({ apiKey });
+    if (apiKeyManager) return apiKeyManager.setApiKey(apiKey);
+    return _writeLegacySecret('gemini', apiKey);
 }
 
 function getGroqApiKey() {
-    return getCredentials().groqApiKey || '';
+    if (apiKeyManager) return apiKeyManager.getGroqApiKey();
+    return _readLegacySecret('groq');
 }
 
 function setGroqApiKey(groqApiKey) {
-    return setCredentials({ groqApiKey });
+    if (apiKeyManager) return apiKeyManager.setGroqApiKey(groqApiKey);
+    return _writeLegacySecret('groq', groqApiKey);
 }
 
 // ============ PREFERENCES ============
@@ -247,13 +301,46 @@ function setKeybinds(keybinds) {
 }
 
 // ============ LIMITS (Rate Limiting) ============
+// Limits are updated on every AI call, so reads/writes are served from an
+// in-memory cache and flushed to disk debounced (and synchronously on exit).
+
+let limitsCache = null;
+let limitsFlushTimer = null;
+
+function _ensureLimitsLoaded() {
+    if (!limitsCache) {
+        const stored = readJsonFile(getLimitsPath(), DEFAULT_LIMITS);
+        limitsCache = { data: Array.isArray(stored.data) ? stored.data : [] };
+    }
+    return limitsCache;
+}
+
+function _scheduleLimitsFlush() {
+    if (limitsFlushTimer) return;
+    limitsFlushTimer = setTimeout(() => {
+        limitsFlushTimer = null;
+        flushLimits();
+    }, 2000);
+    if (limitsFlushTimer.unref) limitsFlushTimer.unref();
+}
+
+/** Force-write pending limit changes to disk. */
+function flushLimits() {
+    if (limitsFlushTimer) {
+        clearTimeout(limitsFlushTimer);
+        limitsFlushTimer = null;
+    }
+    if (limitsCache) writeJsonFile(getLimitsPath(), limitsCache);
+}
 
 function getLimits() {
-    return readJsonFile(getLimitsPath(), DEFAULT_LIMITS);
+    return _ensureLimitsLoaded();
 }
 
 function setLimits(limits) {
-    return writeJsonFile(getLimitsPath(), limits);
+    limitsCache = limits;
+    _scheduleLimitsFlush();
+    return true;
 }
 
 function getTodayDateString() {
@@ -506,6 +593,8 @@ module.exports = {
     setConfig,
     updateConfig,
 
+    setApiKeyManager,
+
     // Credentials
     getCredentials,
     setCredentials,
@@ -526,6 +615,7 @@ module.exports = {
     // Limits (Rate Limiting)
     getLimits,
     setLimits,
+    flushLimits,
     getTodayLimits,
     incrementLimitCount,
     getAvailableModel,

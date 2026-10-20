@@ -3,15 +3,34 @@ const { BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const { saveDebugAudio } = require('../audioUtils');
 const { getSystemPrompt } = require('./prompts');
-const { getAvailableModel, incrementLimitCount, getApiKey, getGroqApiKey, incrementCharUsage, getConfig } = require('../storage');
+const { getAvailableModel, incrementLimitCount, getApiKey, setApiKey, getGroqApiKey, incrementCharUsage, getConfig } = require('../storage');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 const { startTransportLog, logTransportEvent, closeTransportLog } = require('./transportLogger');
+const { normalizeKey, maskKey } = require('./apiKeys');
 
 // Lazy-loaded to avoid circular dependency (localai.js imports from gemini.js)
 let _localai = null;
 function getLocalAi() {
     if (!_localai) _localai = require('./localai');
     return _localai;
+}
+
+// Injected at startup by index.js — provides cached key verification & error classification.
+let apiKeyManager = null;
+function setApiKeyManager(manager) {
+    apiKeyManager = manager;
+}
+
+function verifyKeysBeforeSession(provider, key) {
+    if (!apiKeyManager) return { valid: true };
+    return apiKeyManager.verify(provider, key);
+}
+
+function reportApiError(provider, status, bodyText) {
+    const message = apiKeyManager ? apiKeyManager.classifyApiError(provider, status, bodyText) : `${provider} API error (HTTP ${status})`;
+    sendToRenderer('update-status', message);
+    sendToRenderer('api-key-problem', { provider, status, message });
+    return message;
 }
 
 // Provider mode: 'byok', 'cloud', or 'local'
@@ -76,6 +95,79 @@ function buildContextMessage() {
     const contextLines = validTurns.map(turn => `[Interviewer]: ${turn.transcription.trim()}\n[Your answer]: ${turn.ai_response.trim()}`);
 
     return `Session reconnected. Here's the conversation so far:\n\n${contextLines.join('\n\n')}\n\nContinue from here.`;
+}
+
+// ── Renderer streaming batcher ───────────────────────────────────────────────
+// Token-by-token IPC floods the renderer and makes responses *appear* slow.
+// Batch partial text per stream id and flush at most every FLUSH_INTERVAL_MS.
+
+const STREAM_FLUSH_INTERVAL_MS = 50;
+const pendingStreamText = new Map(); // id -> accumulated full text
+const streamFlushTimers = new Map(); // id -> timer handle
+
+function emitStreamText(id, fullText) {
+    pendingStreamText.set(id, fullText);
+    if (!streamFlushTimers.has(id)) {
+        const timer = setTimeout(() => {
+            streamFlushTimers.delete(id);
+            const text = pendingStreamText.get(id);
+            pendingStreamText.delete(id);
+            if (text !== undefined) sendStreamSnapshot(id, text);
+        }, STREAM_FLUSH_INTERVAL_MS);
+        if (timer.unref) timer.unref();
+        streamFlushTimers.set(id, timer);
+    }
+}
+
+let lastEmittedSnapshot = new Map(); // id -> last text sent to renderer
+
+function sendStreamSnapshot(id, text) {
+    const previous = lastEmittedSnapshot.get(id);
+    const channel = previous === undefined ? 'new-response' : 'update-response';
+    lastEmittedSnapshot.set(id, text);
+    sendToRenderer(channel, text);
+}
+
+function finalizeStream(id, finalText) {
+    // Flush immediately with the definitive text so the UI ends in sync.
+    const timer = streamFlushTimers.get(id);
+    if (timer) {
+        clearTimeout(timer);
+        streamFlushTimers.delete(id);
+    }
+    pendingStreamText.delete(id);
+    if (finalText) sendStreamSnapshot(id, finalText);
+    lastEmittedSnapshot.delete(id);
+}
+
+async function sendSSEChunks(response, streamId, onToken) {
+    // Robust line-based SSE parsing (handles chunks that split mid-line).
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let newlineIndex;
+        while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+            const line = buffer.slice(0, newlineIndex).trim();
+            buffer = buffer.slice(newlineIndex + 1);
+            if (!line.startsWith('data:')) continue;
+            const data = line.slice(5).trim();
+            if (data === '[DONE]') continue;
+            try {
+                const json = JSON.parse(data);
+                const token = json.choices?.[0]?.delta?.content || '';
+                const finishReason = json.choices?.[0]?.finish_reason;
+                if (token || finishReason) onToken(token, finishReason, json);
+            } catch {
+                // Ignore keep-alive comments and partial JSON lines.
+            }
+        }
+    }
 }
 
 // Conversation management functions
@@ -272,6 +364,40 @@ function getGroqReasoningOptions(model, disableThinking) {
     return {};
 }
 
+async function fetchWithRetry(url, options, { retries = 2, timeoutMs = 60000, label = 'request' } = {}) {
+    // Retries only transient failures (network drop / 429 / 5xx) with exponential
+    // backoff + jitter. Auth errors (401/403) fail fast — retrying them is pointless.
+    let lastError = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const response = await fetch(url, { ...options, signal: controller.signal });
+            clearTimeout(timer);
+            if (response.ok || response.status === 401 || response.status === 403 || attempt === retries) {
+                return response;
+            }
+            if (response.status === 429 || response.status >= 500) {
+                lastError = new Error(`HTTP ${response.status}`);
+                lastError.status = response.status;
+                try {
+                    lastError.body = (await response.text()).slice(0, 500);
+                } catch {}
+            } else {
+                return response; // non-retryable client error
+            }
+        } catch (e) {
+            clearTimeout(timer);
+            lastError = e;
+            lastError.status = 0;
+        }
+        const backoff = Math.min(800 * 2 ** attempt, 5000) + Math.floor(Math.random() * 250);
+        console.warn(`[Net] ${label} failed (${lastError.message}), retry ${attempt + 1}/${retries} in ${backoff}ms`);
+        await new Promise(resolve => setTimeout(resolve, backoff));
+    }
+    throw lastError;
+}
+
 async function sendToGroq(transcription) {
     const groqApiKey = getGroqApiKey();
     if (!groqApiKey) {
@@ -302,81 +428,50 @@ async function sendToGroq(transcription) {
         groqConversationHistory = groqConversationHistory.slice(-20);
     }
 
+    const streamId = 'groq-text';
     try {
-        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                Authorization: `Bearer ${groqApiKey}`,
-                'Content-Type': 'application/json',
+        const response = await fetchWithRetry(
+            'https://api.groq.com/openai/v1/chat/completions',
+            {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${groqApiKey}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    model: modelToUse,
+                    messages: [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...groqConversationHistory],
+                    stream: true,
+                    temperature: 0.7,
+                    max_completion_tokens: GROQ_MAX_COMPLETION_TOKENS,
+                    ...getGroqReasoningOptions(modelToUse, config.disableGroqThinking),
+                }),
             },
-            body: JSON.stringify({
-                model: modelToUse,
-                messages: [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...groqConversationHistory],
-                stream: true,
-                temperature: 0.7,
-                max_completion_tokens: GROQ_MAX_COMPLETION_TOKENS,
-                ...getGroqReasoningOptions(modelToUse, config.disableGroqThinking),
-            }),
-        });
+            { label: `Groq text (${modelToUse})` }
+        );
 
         if (!response.ok) {
-            const errorText = await response.text();
-            console.error('Groq API error:', response.status, errorText);
-            logTransportEvent('groq.text.http_error', {
-                status: response.status,
-                body: errorText,
-            });
-            sendToRenderer('update-status', `Groq error: ${response.status}`);
+            const errorText = await response.text().catch(() => '');
+            logTransportEvent('groq.text.http_error', { status: response.status, body: errorText });
+            reportApiError('groq', response.status, errorText);
             return;
         }
 
-        logTransportEvent('groq.text.http_response', {
-            status: response.status,
-        });
+        logTransportEvent('groq.text.http_response', { status: response.status });
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
         let fullText = '';
-        let isFirst = true;
         let finishReason = null;
 
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const chunk = decoder.decode(value, { stream: true });
-            logTransportEvent('groq.text.stream_chunk', { chunk });
-            const lines = chunk.split('\n').filter(line => line.trim() !== '');
-
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const data = line.slice(6);
-                    if (data === '[DONE]') continue;
-
-                    try {
-                        const json = JSON.parse(data);
-                        logTransportEvent('groq.text.stream_event', json);
-                        finishReason = json.choices?.[0]?.finish_reason || finishReason;
-                        const token = json.choices?.[0]?.delta?.content || '';
-                        if (token) {
-                            fullText += token;
-                            const displayText = stripThinkingTags(fullText);
-                            if (displayText) {
-                                sendToRenderer(isFirst ? 'new-response' : 'update-response', displayText);
-                                isFirst = false;
-                            }
-                        }
-                    } catch (parseError) {
-                        logTransportEvent('groq.text.stream_parse_error', {
-                            data,
-                            error: parseError.message,
-                        });
-                    }
-                }
-            }
-        }
+        await sendSSEChunks(response, streamId, (token, reason) => {
+            if (reason) finishReason = reason;
+            if (!token) return;
+            fullText += token;
+            const displayText = stripThinkingTags(fullText);
+            if (displayText) emitStreamText(streamId, displayText);
+        });
 
         const cleanedResponse = stripThinkingTags(fullText);
+        finalizeStream(streamId, cleanedResponse);
         const modelKey = modelToUse.split('/').pop();
 
         const systemPromptChars = (currentSystemPrompt || 'You are a helpful assistant.').length;
@@ -395,11 +490,7 @@ async function sendToGroq(transcription) {
             saveConversationTurn(transcription, cleanedResponse);
         } else {
             console.warn(`Groq returned no final answer (${modelToUse})`);
-            logTransportEvent('groq.text.empty_response', {
-                model: modelToUse,
-                fullText,
-                finishReason,
-            });
+            logTransportEvent('groq.text.empty_response', { model: modelToUse, fullText, finishReason });
             sendToRenderer('new-response', GROQ_EMPTY_RESPONSE_MESSAGE);
             sendToRenderer('update-status', 'Groq reached the completion-token limit');
             return;
@@ -412,17 +503,18 @@ async function sendToGroq(transcription) {
         console.log(`Groq response completed (${modelToUse})`);
         sendToRenderer('update-status', 'Listening...');
     } catch (error) {
+        finalizeStream(streamId, null);
         console.error('Error calling Groq API:', error);
-        logTransportEvent('groq.text.error', {
-            error: error.message,
-            stack: error.stack,
-        });
-        sendToRenderer('update-status', 'Groq error: ' + error.message);
+        logTransportEvent('groq.text.error', { error: error.message, stack: error.stack });
+        reportApiError('groq', error.status ?? 0, error.body || error.message);
     }
 }
 
 async function sendImageToGroq(base64Data, prompt) {
     const groqApiKey = getGroqApiKey();
+    if (!groqApiKey) {
+        return { success: false, error: 'No Groq API key configured' };
+    }
     const config = getConfig();
     const model = config.groqImageModel;
 
@@ -432,100 +524,66 @@ async function sendImageToGroq(base64Data, prompt) {
         imageBytes: Buffer.byteLength(base64Data, 'base64'),
     });
 
+    const streamId = 'groq-image';
     try {
-        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                Authorization: `Bearer ${groqApiKey}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                model,
-                messages: [
-                    { role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' },
-                    {
-                        role: 'user',
-                        content: [
-                            { type: 'text', text: prompt },
-                            {
-                                type: 'image_url',
-                                image_url: {
-                                    url: `data:image/jpeg;base64,${base64Data}`,
+        const response = await fetchWithRetry(
+            'https://api.groq.com/openai/v1/chat/completions',
+            {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${groqApiKey}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    model,
+                    messages: [
+                        { role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' },
+                        {
+                            role: 'user',
+                            content: [
+                                { type: 'text', text: prompt },
+                                {
+                                    type: 'image_url',
+                                    image_url: {
+                                        url: `data:image/jpeg;base64,${base64Data}`,
+                                    },
                                 },
-                            },
-                        ],
-                    },
-                ],
-                stream: true,
-                temperature: 0.7,
-                max_completion_tokens: GROQ_MAX_COMPLETION_TOKENS,
-                ...getGroqReasoningOptions(model, config.disableGroqThinking),
-            }),
-        });
+                            ],
+                        },
+                    ],
+                    stream: true,
+                    temperature: 0.7,
+                    max_completion_tokens: GROQ_MAX_COMPLETION_TOKENS,
+                    ...getGroqReasoningOptions(model, config.disableGroqThinking),
+                }),
+            },
+            { label: `Groq vision (${model})` }
+        );
 
         if (!response.ok) {
-            const errorText = await response.text();
-            console.error('Groq image API error:', response.status, errorText);
-            logTransportEvent('groq.image.http_error', {
-                status: response.status,
-                body: errorText,
-            });
-            return { success: false, error: `Groq error: ${response.status}` };
+            const errorText = await response.text().catch(() => '');
+            logTransportEvent('groq.image.http_error', { status: response.status, body: errorText });
+            const message = reportApiError('groq', response.status, errorText);
+            return { success: false, error: message };
         }
 
-        logTransportEvent('groq.image.http_response', {
-            status: response.status,
-        });
+        logTransportEvent('groq.image.http_response', { status: response.status });
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
         let fullText = '';
-        let isFirst = true;
         let finishReason = null;
 
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const chunk = decoder.decode(value, { stream: true });
-            logTransportEvent('groq.image.stream_chunk', { chunk });
-            const lines = chunk.split('\n').filter(line => line.trim() !== '');
-
-            for (const line of lines) {
-                if (!line.startsWith('data: ')) continue;
-
-                const data = line.slice(6);
-                if (data === '[DONE]') continue;
-
-                try {
-                    const json = JSON.parse(data);
-                    logTransportEvent('groq.image.stream_event', json);
-                    finishReason = json.choices?.[0]?.finish_reason || finishReason;
-                    const token = json.choices?.[0]?.delta?.content || '';
-                    if (!token) continue;
-
-                    fullText += token;
-                    const displayText = stripThinkingTags(fullText);
-                    if (displayText) {
-                        sendToRenderer(isFirst ? 'new-response' : 'update-response', displayText);
-                        isFirst = false;
-                    }
-                } catch (parseError) {
-                    logTransportEvent('groq.image.stream_parse_error', {
-                        data,
-                        error: parseError.message,
-                    });
-                }
-            }
-        }
+        await sendSSEChunks(response, streamId, (token, reason) => {
+            if (reason) finishReason = reason;
+            if (!token) return;
+            fullText += token;
+            const displayText = stripThinkingTags(fullText);
+            if (displayText) emitStreamText(streamId, displayText);
+        });
 
         const cleanedResponse = stripThinkingTags(fullText);
+        finalizeStream(streamId, cleanedResponse);
         if (!cleanedResponse) {
-            logTransportEvent('groq.image.empty_response', {
-                model,
-                fullText,
-                finishReason,
-            });
+            logTransportEvent('groq.image.empty_response', { model, fullText, finishReason });
             return { success: false, error: GROQ_EMPTY_RESPONSE_MESSAGE };
         }
 
@@ -536,12 +594,11 @@ async function sendImageToGroq(base64Data, prompt) {
         });
         return { success: true, text: cleanedResponse, model };
     } catch (error) {
+        finalizeStream(streamId, null);
         console.error('Error calling Groq image API:', error);
-        logTransportEvent('groq.image.error', {
-            error: error.message,
-            stack: error.stack,
-        });
-        return { success: false, error: error.message };
+        logTransportEvent('groq.image.error', { error: error.message, stack: error.stack });
+        const message = reportApiError('groq', error.status ?? 0, error.body || error.message);
+        return { success: false, error: message };
     }
 }
 
@@ -587,16 +644,16 @@ async function sendToGemma(transcription) {
         });
 
         let fullText = '';
-        let isFirst = true;
 
+        const gemmaStreamId = 'gemma-text';
         for await (const chunk of response) {
             const chunkText = chunk.text;
             if (chunkText) {
                 fullText += chunkText;
-                sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
-                isFirst = false;
+                emitStreamText(gemmaStreamId, fullText);
             }
         }
+        finalizeStream(gemmaStreamId, fullText);
 
         const systemPromptChars = (currentSystemPrompt || 'You are a helpful assistant.').length;
         const historyChars = trimmedHistory.reduce((sum, msg) => sum + (msg.content || '').length, 0);
@@ -632,6 +689,35 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         return false;
     }
 
+    // Normalize the key once at the boundary — silently fixes trailing spaces /
+    // quotes pasted from docs, which is a top cause of "invalid API key" errors.
+    const normalizedKey = normalizeKey(apiKey);
+    if (!normalizedKey) {
+        sendToRenderer('update-status', 'No Gemini API key configured. Add it in Settings.');
+        sendToRenderer('api-key-problem', { provider: 'gemini', status: 0, message: 'No Gemini API key configured' });
+        return null;
+    }
+    if (!isReconnect && normalizedKey !== apiKey) {
+        setApiKey(normalizedKey); // persist the cleaned version
+    }
+
+    // Fail fast with an actionable message instead of a cryptic socket error.
+    if (!isReconnect && apiKeyManager) {
+        const shapeError = require('./apiKeys').getShapeError('gemini', normalizedKey);
+        if (shapeError) {
+            sendToRenderer('update-status', shapeError);
+            sendToRenderer('api-key-problem', { provider: 'gemini', status: 0, message: shapeError });
+            return null;
+        }
+        sendToRenderer('update-status', 'Verifying API key…');
+        const verification = await apiKeyManager.verify('gemini', normalizedKey);
+        if (!verification.valid) {
+            sendToRenderer('update-status', verification.error || 'Gemini API key rejected');
+            sendToRenderer('api-key-problem', { provider: 'gemini', status: verification.status, message: verification.error });
+            return null;
+        }
+    }
+
     isInitializingSession = true;
     if (!isReconnect) {
         sendToRenderer('session-initializing', true);
@@ -639,13 +725,13 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
 
     // Store params for reconnection
     if (!isReconnect) {
-        sessionParams = { apiKey, customPrompt, profile, language };
+        sessionParams = { apiKey: normalizedKey, customPrompt, profile, language };
         reconnectAttempts = 0;
     }
 
     const client = new GoogleGenAI({
         vertexai: false,
-        apiKey: apiKey,
+        apiKey: normalizedKey,
         httpOptions: { apiVersion: 'v1alpha' },
     });
 
@@ -999,9 +1085,11 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
 
     const apiKey = getApiKey();
     if (!apiKey) {
-        return { success: false, error: 'No API key configured' };
+        sendToRenderer('api-key-problem', { provider: 'gemini', status: 0, message: 'No Gemini API key configured' });
+        return { success: false, error: 'No API key configured. Add your Gemini key in Settings.' };
     }
 
+    const streamId = 'gemini-image';
     try {
         const ai = new GoogleGenAI({ apiKey: apiKey });
 
@@ -1024,18 +1112,16 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
         // Increment count after successful call
         incrementLimitCount(model);
 
-        // Stream the response
+        // Stream the response (batched to the renderer for smoothness)
         let fullText = '';
-        let isFirst = true;
         for await (const chunk of response) {
             const chunkText = chunk.text;
             if (chunkText) {
                 fullText += chunkText;
-                // Send to renderer - new response for first chunk, update for subsequent
-                sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
-                isFirst = false;
+                emitStreamText(streamId, fullText);
             }
         }
+        finalizeStream(streamId, fullText);
 
         console.log(`Image response completed from ${model}`);
 
@@ -1044,7 +1130,17 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
 
         return { success: true, text: fullText, model: model };
     } catch (error) {
+        finalizeStream(streamId, null);
         console.error('Error sending image to Gemini HTTP:', error);
+        const status = error.status || error.response?.status || 0;
+        if (status === 401 || status === 403 || /api.?key/i.test(String(error.message))) {
+            const message = reportApiError('gemini', status || 401, error.message);
+            return { success: false, error: message };
+        }
+        if (status === 429) {
+            const message = reportApiError('gemini', 429, error.message);
+            return { success: false, error: message };
+        }
         return { success: false, error: error.message };
     }
 }
@@ -1080,6 +1176,34 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             return true;
         }
         return false;
+    });
+
+    // ── API key health: verification + status (used by Settings UI) ──
+    ipcMain.handle('verify-api-key', async (event, provider, keyOverride) => {
+        if (!apiKeyManager) return { success: false, error: 'Key manager unavailable' };
+        try {
+            const result = await apiKeyManager.verify(provider, typeof keyOverride === 'string' ? keyOverride : undefined);
+            return { success: true, ...result };
+        } catch (error) {
+            return { success: false, valid: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('get-api-key-status', async () => {
+        if (!apiKeyManager) return { success: true, data: {} };
+        const status = {};
+        for (const provider of ['gemini', 'groq']) {
+            const key = provider === 'gemini' ? apiKeyManager.getApiKey() : apiKeyManager.getGroqApiKey();
+            const cached = apiKeyManager.getCachedVerification(provider);
+            status[provider] = {
+                configured: !!key,
+                masked: maskKey(key),
+                verified: cached ? cached.valid : null,
+                lastCheckedAt: cached ? cached.checkedAt : null,
+                error: cached && !cached.valid ? cached.error : null,
+            };
+        }
+        return { success: true, data: status };
     });
 
     ipcMain.handle('initialize-local', async (event, localLlmModel, whisperModel, profile, customPrompt) => {
