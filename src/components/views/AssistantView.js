@@ -41,6 +41,17 @@ export class AssistantView extends LitElement {
             display: inline-block;
         }
 
+        /* One persistent block per response — never rebuilt while streaming. */
+        .response-block {
+            white-space: pre-wrap;
+            overflow-wrap: break-word;
+        }
+
+        /* Once Markdown is applied, let HTML elements control spacing. */
+        .response-block.markdown-rendered {
+            white-space: normal;
+        }
+
         /* ── Markdown ── */
 
         .response-container h1,
