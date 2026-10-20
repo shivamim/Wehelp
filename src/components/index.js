@@ -1,3 +1,6 @@
+// Utilities bundled into the renderer (UMD modules — safe to import for side effects)
+import '../utils/streamingRenderer.js';
+
 // Main app components
 export { CheatingDaddyApp } from './app/CheatingDaddyApp.js';
 export { AppHeader } from './app/AppHeader.js';
