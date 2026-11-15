@@ -588,7 +588,8 @@ function handleShortcut(shortcutKey) {
 
     if (shortcutKey === 'ctrl+enter' || shortcutKey === 'cmd+enter') {
         if (currentView === 'main') {
-            cheatingDaddy.element().handleStart();
+            // Global shortcuts must use the same pending-key-save gate as the button.
+            cheatingDaddy.element().shadowRoot.querySelector('main-view')?._handleStart();
         } else {
             captureManualScreenshot();
         }

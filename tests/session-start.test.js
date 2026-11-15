@@ -161,3 +161,23 @@ test('successful initialization uses the same structured result contract', async
     const result = await handlers.get('initialize-gemini')({}, undefined, '', 'interview', 'en-US');
     assert.equal(result.success, true);
 });
+test('global keyboard shortcut uses the same credential-save gate as the Start button', () => {
+    const source = fs.readFileSync('src/utils/renderer.js', 'utf8').replace(/\r\n/g, '\n');
+    const handler = source.slice(source.indexOf('function handleShortcut('), source.indexOf('// Create reference to the main app element'));
+    let calls = 0;
+    const context = {
+        cheatingDaddy: {
+            getCurrentView: () => 'main',
+            element: () => ({
+                shadowRoot: { querySelector: () => ({ _handleStart: () => calls++ }) },
+                handleStart: () => {
+                    throw new Error('Bypassed credential save');
+                },
+            }),
+        },
+        captureManualScreenshot() {},
+    };
+    vm.createContext(context);
+    vm.runInContext(handler + "\nhandleShortcut('ctrl+enter');", context);
+    assert.equal(calls, 1);
+});
