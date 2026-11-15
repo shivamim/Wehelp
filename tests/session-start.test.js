@@ -9,6 +9,7 @@ function mainView(storage) {
     const source =
         fs
             .readFileSync('src/components/views/MainView.js', 'utf8')
+            .replace(/\r\n/g, '\n')
             .replace(/^import .*;\n/gm, '')
             .replace('export class MainView', 'class MainView') + '\nmodule.exports = MainView;';
     vm.runInNewContext(source, {
