@@ -41,6 +41,7 @@ const DEFAULT_CONFIG = {
     alwaysOnTop: false,
     screenSharePrivacy: false,
     minimizeToTray: true,
+    hideFromTaskbar: false,
     launchAtLogin: false,
 };
 

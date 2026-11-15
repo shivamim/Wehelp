@@ -239,6 +239,21 @@ export class EngineSettings extends LitElement {
                     </p>
                     <p>Off by default. Changes apply immediately and are saved for the next launch.</p>
                 </details>
+                <label
+                    ><span
+                        ><input
+                            type="checkbox"
+                            .checked=${!!this.config.hideFromTaskbar}
+                            ?disabled=${window.wehelp.platform === 'darwin'}
+                            @change=${event => this.save('hideFromTaskbar', event.target.checked)}
+                        />
+                        Hide from taskbar</span
+                    ></label
+                >
+                <p>
+                    Keep WeHelp available in the system tray. Use the tray icon → Show WeHelp to restore it, or Quit WeHelp to exit. This option does
+                    not control screen-sharing privacy.
+                </p>
                 ${['alwaysOnTop', 'minimizeToTray', 'launchAtLogin'].map(
                     key =>
                         html`<label

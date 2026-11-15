@@ -20,6 +20,7 @@ const CONFIG_KEYS = new Set([
     'screenSharePrivacy',
     'launchAtLogin',
     'minimizeToTray',
+    'hideFromTaskbar',
 ]);
 function object(value) {
     return (
@@ -95,7 +96,9 @@ function validateConfig(config) {
         if (key === 'groqMaxOutputTokens' && (!Number.isInteger(value) || value < 128 || value > 16384))
             throw new Error('Invalid output token budget');
         if (
-            ['disableGroqThinking', 'onboarded', 'alwaysOnTop', 'screenSharePrivacy', 'launchAtLogin', 'minimizeToTray'].includes(key) &&
+            ['disableGroqThinking', 'onboarded', 'alwaysOnTop', 'screenSharePrivacy', 'launchAtLogin', 'minimizeToTray', 'hideFromTaskbar'].includes(
+                key
+            ) &&
             typeof value !== 'boolean'
         )
             throw new Error('Expected boolean');

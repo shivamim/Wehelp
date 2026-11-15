@@ -9,3 +9,9 @@ This uses Electron's native `setContentProtection` API, which asks Windows to ex
 Linux and macOS are not offered this toggle in WeHelp. Electron documents that modern macOS ScreenCaptureKit can ignore its protection API. No Google Meet session was used for the automated tests. Windows CI tests validate native enable/disable and settings persistence only; they do not prove invisibility across sharing clients.
 
 Reference: [Electron content protection](https://www.electronjs.org/docs/latest/api/browser-window#winsetcontentprotectionenable-macos-windows).
+
+## Taskbar and local window controls (2.0.4)
+
+In Settings → Response engine and audio, enable **Hide from taskbar** to omit the window from the Windows/Linux taskbar. The tray icon remains available: choose **Show WeHelp** to restore/focus the window or **Quit WeHelp** to exit. This setting is off by default and persists across launches. macOS does not expose this taskbar option.
+
+Use **Always on top** separately to keep the window above ordinary application windows, and the existing appearance/transparency setting to adjust its local appearance. Taskbar hiding does not itself exclude anything from screen sharing.

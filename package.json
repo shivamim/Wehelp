@@ -1,7 +1,7 @@
 {
     "name": "wehelp",
     "productName": "WeHelp",
-    "version": "2.0.3",
+    "version": "2.0.4",
     "description": "Real-time multimodal AI desktop assistant",
     "main": "src/index.js",
     "scripts": {

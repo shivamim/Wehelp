@@ -28,6 +28,8 @@ test('unsupported platforms, invalid values and failed native application report
     applyScreenSharePrivacy(null, false, 'linux');
 });
 test('IPC accepts only boolean capture-privacy preferences', () => {
+    validate('storage:update-config', ['hideFromTaskbar', true]);
+    assert.throws(() => validate('storage:update-config', ['hideFromTaskbar', 'true']), /boolean/);
     validate('storage:update-config', ['screenSharePrivacy', true]);
     validate('storage:set-config', [{ screenSharePrivacy: false }]);
     assert.throws(() => validate('storage:update-config', ['screenSharePrivacy', 'true']), /boolean/);

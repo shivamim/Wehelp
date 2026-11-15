@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.4 — optional taskbar hiding
+
+- Add a persistent Hide from taskbar setting, applied immediately on Windows/Linux while keeping the system tray available.
+- Preserve explicit Show WeHelp and Quit tray actions; restore minimized windows before focusing them.
+- Keep taskbar visibility separate from screen-sharing capture privacy and Always on top.
+
 ## 2.0.3 — optional screen-sharing privacy
 
 - Add an opt-in Windows capture-exclusion toggle under Response engine and audio → Screen-sharing privacy.
