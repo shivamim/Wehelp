@@ -17,6 +17,7 @@ const CONFIG_KEYS = new Set([
     'audioChunkMs',
     'endpointSilenceMs',
     'alwaysOnTop',
+    'screenSharePrivacy',
     'launchAtLogin',
     'minimizeToTray',
 ]);
@@ -93,7 +94,10 @@ function validateConfig(config) {
             throw new Error('Endpoint silence must be 400–2000 ms');
         if (key === 'groqMaxOutputTokens' && (!Number.isInteger(value) || value < 128 || value > 16384))
             throw new Error('Invalid output token budget');
-        if (['disableGroqThinking', 'onboarded', 'alwaysOnTop', 'launchAtLogin', 'minimizeToTray'].includes(key) && typeof value !== 'boolean')
+        if (
+            ['disableGroqThinking', 'onboarded', 'alwaysOnTop', 'screenSharePrivacy', 'launchAtLogin', 'minimizeToTray'].includes(key) &&
+            typeof value !== 'boolean'
+        )
             throw new Error('Expected boolean');
     }
 }

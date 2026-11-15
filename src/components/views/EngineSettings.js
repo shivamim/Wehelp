@@ -219,6 +219,26 @@ export class EngineSettings extends LitElement {
                           >`
                         : ''
                 }
+                <details>
+                    <summary>Screen-sharing privacy</summary>
+                    <label
+                        ><span
+                            ><input
+                                type="checkbox"
+                                .checked=${!!this.config.screenSharePrivacy}
+                                ?disabled=${window.wehelp.platform !== 'win32'}
+                                @change=${event => this.save('screenSharePrivacy', event.target.checked)}
+                            />
+                            Hide WeHelp from screen capture (Windows)</span
+                        ></label
+                    >
+                    <p>
+                        ${window.wehelp.platform !== 'win32' ? 'This option is currently supported on Windows only. ' : ''}Uses Windows capture
+                        exclusion. WeHelp stays visible to you. Google Meet or other sharing methods may still capture it: verify the view from
+                        another participant/device before relying on it. Sharing a specific app window is more reliable.
+                    </p>
+                    <p>Off by default. Changes apply immediately and are saved for the next launch.</p>
+                </details>
                 ${['alwaysOnTop', 'minimizeToTray', 'launchAtLogin'].map(
                     key =>
                         html`<label

@@ -1,5 +1,9 @@
 # Security and privacy
 
+## Optional Windows capture-exclusion privacy (2.0.3)
+
+A user-controlled setting now requests native Windows capture exclusion for the WeHelp window. It is off by default and keeps ordinary local capture controls, taskbar/tray visibility and recording indicators. It is not a guarantee about Google Meet, remote sessions or every capture method. See [Screen-sharing privacy](SCREEN_SHARING_PRIVACY.md) and verify the actual remote view before relying on it.
+
 ## Capture permission repair in 2.0.2
 
 Display sharing is an Electron `display-capture` permission, not a camera request. The 2.0.1 handler rejected it before the consent chooser, causing “Capture error: Permission denied.” The repaired policy checks the exact local top frame and delegates display permission to the explicit sharing dialog. Camera requests remain denied; microphone requests still require confirmation. Both permission-check and permission-request handlers are installed. The display source is returned only after approval and rechecking the window/frame; Cancel returns no source. Real Electron display-capture smoke tests verify approval, video-track cleanup and cancellation in addition to policy unit tests.
@@ -16,7 +20,7 @@ Reference: [Electron session permissions](https://www.electronjs.org/docs/latest
 - Stored Gemini/Groq key material is never returned to renderer password fields. Replacement values necessarily originate in those user-input fields, then cross the restricted setter into main. They are not echoed back. Key verification caches are main-process only.
 - Session file IDs reject traversal. Runtime configs, binary PCM, text/image payload sizes, external links and shortcut shapes receive IPC validation.
 - Capture remains user controlled; the application does not request screen/microphone access at launch. System audio sharing and microphone sharing have explicit dialogs. Microphone-only sessions do not start screen sharing. Stop releases all tracked audio streams/nodes/contexts and native capture processes. No process-wide pkill remains.
-- Conventional tray/window operation replaces taskbar/Mission Control concealment and content-protection settings. Custom movement/visibility/click-through shortcuts remain user controlled; no monitoring-evasion functionality was added.
+- Conventional tray/window operation replaces taskbar/Mission Control concealment and unconditional content-protection settings. Custom movement/visibility/click-through shortcuts remain user controlled; no monitoring-evasion functionality was added.
 - Raw provider transport logs are disabled. Main generation/local STT/relay no longer log transcripts or credential-bearing URLs. Native process output is opt-in via DEBUG_NATIVE. DEBUG_AUDIO remains an explicit developer diagnostic and can persist sensitive audio; do not enable it in ordinary sessions.
 - Model/runtimes are downloaded lazily after a confirmation; upstream checksums are preserved. Strict Offline does not download or discover. Native servers bind loopback only. No API keys, test-user data or private logs are packaged.
 

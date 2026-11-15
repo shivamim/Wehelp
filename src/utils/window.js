@@ -34,6 +34,8 @@ function createWindow(sendToRenderer, geminiSessionRef) {
         backgroundColor: '#00000000',
     });
 
+    require('./screen-share-privacy').applyScreenSharePrivacy(mainWindow, storage.getConfig().screenSharePrivacy === true);
+
     const { session, desktopCapturer, dialog } = require('electron');
     const { pathToFileURL } = require('node:url');
     const trustedURL = pathToFileURL(path.join(__dirname, '../index.html')).href;
