@@ -29,6 +29,13 @@ let shutdownComplete = false;
 const geminiSessionRef = { current: null };
 let mainWindow = null;
 
+function restoreMainWindow() {
+    if (!mainWindow || mainWindow.isDestroyed()) createMainWindow();
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+}
+
 function createMainWindow() {
     mainWindow = createWindow(sendToRenderer, geminiSessionRef);
     return mainWindow;
@@ -60,19 +67,13 @@ app.whenReady()
             Menu.buildFromTemplate([
                 {
                     label: 'Show WeHelp',
-                    click: () => {
-                        mainWindow.show();
-                        mainWindow.focus();
-                    },
+                    click: restoreMainWindow,
                 },
                 { label: 'Stop session', click: () => shutdownSession() },
                 { label: 'Quit WeHelp', click: () => app.quit() },
             ])
         );
-        tray.on('double-click', () => {
-            mainWindow.show();
-            mainWindow.focus();
-        });
+        tray.on('double-click', restoreMainWindow);
         mainWindow.on('minimize', event => {
             if (storage.getConfig().minimizeToTray) {
                 event.preventDefault();
@@ -133,13 +134,16 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:set-config', async (event, config) => {
         const previousPrivacy = storage.getConfig().screenSharePrivacy === true;
+        const previousTaskbar = storage.getConfig().hideFromTaskbar === true;
         if (Object.keys(config).some(key => /Model$|Provider$|performanceMode/.test(key))) await shutdownSession();
         try {
             if ('screenSharePrivacy' in config) applyScreenSharePrivacy(mainWindow, config.screenSharePrivacy);
+            if ('hideFromTaskbar' in config && process.platform !== 'darwin') mainWindow?.setSkipTaskbar(config.hideFromTaskbar);
             if ((await storage.setConfig(config)) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
             if ('screenSharePrivacy' in config) applyScreenSharePrivacy(mainWindow, previousPrivacy);
+            if ('hideFromTaskbar' in config && process.platform !== 'darwin') mainWindow?.setSkipTaskbar(previousTaskbar);
             console.error('Error setting config:', error);
             return { success: false, error: error.message };
         }
@@ -147,15 +151,18 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:update-config', async (event, key, value) => {
         const previousPrivacy = storage.getConfig().screenSharePrivacy === true;
+        const previousTaskbar = storage.getConfig().hideFromTaskbar === true;
         if (/Model$|Provider$|performanceMode/.test(key) && storage.getConfig()[key] !== value) await shutdownSession();
         try {
             if (key === 'screenSharePrivacy') applyScreenSharePrivacy(mainWindow, value);
+            if (key === 'hideFromTaskbar' && process.platform !== 'darwin') mainWindow?.setSkipTaskbar(value);
             if (key === 'alwaysOnTop') mainWindow?.setAlwaysOnTop(value);
             if (key === 'launchAtLogin') app.setLoginItemSettings({ openAtLogin: value });
             if ((await storage.updateConfig(key, value)) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
             if (key === 'screenSharePrivacy') applyScreenSharePrivacy(mainWindow, previousPrivacy);
+            if (key === 'hideFromTaskbar' && process.platform !== 'darwin') mainWindow?.setSkipTaskbar(previousTaskbar);
             console.error('Error updating config:', error);
             return { success: false, error: error.message };
         }

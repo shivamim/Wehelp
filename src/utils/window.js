@@ -34,6 +34,7 @@ function createWindow(sendToRenderer, geminiSessionRef) {
         backgroundColor: '#00000000',
     });
 
+    if (process.platform !== 'darwin') mainWindow.setSkipTaskbar(storage.getConfig().hideFromTaskbar === true);
     require('./screen-share-privacy').applyScreenSharePrivacy(mainWindow, storage.getConfig().screenSharePrivacy === true);
 
     const { session, desktopCapturer, dialog } = require('electron');
