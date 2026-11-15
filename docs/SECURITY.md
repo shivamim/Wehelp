@@ -1,5 +1,11 @@
 # Security and privacy
 
+## Capture permission repair in 2.0.2
+
+Display sharing is an Electron `display-capture` permission, not a camera request. The 2.0.1 handler rejected it before the consent chooser, causing “Capture error: Permission denied.” The repaired policy checks the exact local top frame and delegates display permission to the explicit sharing dialog. Camera requests remain denied; microphone requests still require confirmation. Both permission-check and permission-request handlers are installed. The display source is returned only after approval and rechecking the window/frame; Cancel returns no source. Real Electron display-capture smoke tests verify approval, video-track cleanup and cancellation in addition to policy unit tests.
+
+Reference: [Electron session permissions](https://www.electronjs.org/docs/latest/api/session#sessetpermissionrequesthandlerhandler).
+
 ## Implemented
 
 - Pinned Electron 45.3.2, renderer `nodeIntegration: false`, `contextIsolation: true`, `sandbox: true`, `webSecurity: true`, and insecure content disabled. The installed package was reviewed because modern Electron uses a lazy binary install; Node 24 meets its requirements.

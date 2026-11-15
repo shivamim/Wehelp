@@ -39,42 +39,12 @@ function createWindow(sendToRenderer, geminiSessionRef) {
     const trustedURL = pathToFileURL(path.join(__dirname, '../index.html')).href;
     mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     mainWindow.webContents.on('will-navigate', event => event.preventDefault());
-    session.defaultSession.setPermissionRequestHandler(async (contents, permission, callback, details) => {
-        if (
-            contents !== mainWindow.webContents ||
-            contents.getURL() !== trustedURL ||
-            permission !== 'media' ||
-            details.mediaTypes?.includes('video')
-        )
-            return callback(false);
-        const result = await dialog.showMessageBox(mainWindow, {
-            type: 'question',
-            buttons: ['Allow microphone', 'Cancel'],
-            defaultId: 1,
-            cancelId: 1,
-            message: 'Allow WeHelp to capture microphone audio for this session?',
-            detail: 'Audio is sent to your selected provider. Stop Session ends capture.',
-        });
-        callback(result.response === 0);
-    });
-    session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
-        if (request.frame !== mainWindow.webContents.mainFrame || mainWindow.webContents.getURL() !== trustedURL) return callback({});
-        try {
-            const result = await dialog.showMessageBox(mainWindow, {
-                type: 'question',
-                buttons: ['Share primary display', 'Cancel'],
-                defaultId: 1,
-                cancelId: 1,
-                message: request.audioRequested ? 'Share primary display and system audio with WeHelp?' : 'Share primary display with WeHelp?',
-                detail: 'Screenshots are analyzed only when you request them. System audio is sent to the selected provider while the session is active.',
-            });
-            if (result.response !== 0) return callback({});
-            const sources = await desktopCapturer.getSources({ types: ['screen'] });
-            callback(sources[0] ? { video: sources[0], ...(request.audioRequested ? { audio: 'loopback' } : {}) } : {});
-        } catch (error) {
-            console.error('Display capture failed:', error.message);
-            callback({});
-        }
+    require('../security/capture-permissions').installCapturePermissions({
+        session: session.defaultSession,
+        window: mainWindow,
+        trustedURL,
+        dialog,
+        desktopCapturer,
     });
 
     mainWindow.loadFile(path.join(__dirname, '../index.html'));
