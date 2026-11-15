@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.3 — optional screen-sharing privacy
+
+- Add an opt-in Windows capture-exclusion toggle under Response engine and audio → Screen-sharing privacy.
+- Apply it immediately, preserve it across restart, and validate boolean settings through the restricted IPC bridge.
+- Keep the app visible locally and retain ordinary capture/session controls. Do not claim universal Google Meet invisibility.
+
 ## 2.0.2 — capture permission repair
 
 - Handle Electron display-capture permission separately from camera/microphone media permission.

@@ -39,6 +39,7 @@ const DEFAULT_CONFIG = {
     audioChunkMs: 100,
     endpointSilenceMs: 700,
     alwaysOnTop: false,
+    screenSharePrivacy: false,
     minimizeToTray: true,
     launchAtLogin: false,
 };

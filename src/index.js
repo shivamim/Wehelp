@@ -7,6 +7,7 @@ const { app, BrowserWindow, shell, ipcMain, Tray, Menu, nativeImage } = require(
 const { createWindow, updateGlobalShortcuts } = require('./utils/window');
 const { setupGeminiIpcHandlers, stopMacOSAudioCapture, sendToRenderer } = require('./utils/gemini');
 const storage = require('./storage');
+const { applyScreenSharePrivacy } = require('./utils/screen-share-privacy');
 const { ApiKeyManager } = require('./utils/apiKeys');
 const { setApiKeyManager, setRuntimeConfigGetter, shutdownSession, generation } = require('./utils/gemini');
 const { monitor } = require('./engine/performance-monitor');
@@ -131,24 +132,30 @@ function setupStorageIpcHandlers() {
     });
 
     ipcMain.handle('storage:set-config', async (event, config) => {
+        const previousPrivacy = storage.getConfig().screenSharePrivacy === true;
         if (Object.keys(config).some(key => /Model$|Provider$|performanceMode/.test(key))) await shutdownSession();
         try {
+            if ('screenSharePrivacy' in config) applyScreenSharePrivacy(mainWindow, config.screenSharePrivacy);
             if ((await storage.setConfig(config)) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
+            if ('screenSharePrivacy' in config) applyScreenSharePrivacy(mainWindow, previousPrivacy);
             console.error('Error setting config:', error);
             return { success: false, error: error.message };
         }
     });
 
     ipcMain.handle('storage:update-config', async (event, key, value) => {
+        const previousPrivacy = storage.getConfig().screenSharePrivacy === true;
         if (/Model$|Provider$|performanceMode/.test(key) && storage.getConfig()[key] !== value) await shutdownSession();
         try {
+            if (key === 'screenSharePrivacy') applyScreenSharePrivacy(mainWindow, value);
             if (key === 'alwaysOnTop') mainWindow?.setAlwaysOnTop(value);
             if (key === 'launchAtLogin') app.setLoginItemSettings({ openAtLogin: value });
             if ((await storage.updateConfig(key, value)) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
+            if (key === 'screenSharePrivacy') applyScreenSharePrivacy(mainWindow, previousPrivacy);
             console.error('Error updating config:', error);
             return { success: false, error: error.message };
         }

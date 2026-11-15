@@ -75,6 +75,19 @@ app.on('browser-window-created', (_event, win) => {
                 result.unsafeExecuted
             )
                 throw new Error('Isolation or HTML safety failed');
+            if (process.platform === 'win32') {
+                const enabled = await win.webContents.executeJavaScript(
+                    "window.wehelp.operations['storage:update-config']('screenSharePrivacy', true)"
+                );
+                if (!enabled.success || !win.isContentProtected()) throw new Error('Native screen-sharing privacy did not enable');
+                const saved = await win.webContents.executeJavaScript("window.wehelp.operations['storage:get-config']()");
+                if (!saved.data.screenSharePrivacy) throw new Error('Screen-sharing privacy setting was not saved');
+                const disabled = await win.webContents.executeJavaScript(
+                    "window.wehelp.operations['storage:update-config']('screenSharePrivacy', false)"
+                );
+                if (!disabled.success || win.isContentProtected()) throw new Error('Native screen-sharing privacy did not disable');
+                result.nativeCapturePrivacyToggle = true;
+            }
             if (errors.length) throw new Error('Renderer errors: ' + errors.join('; '));
             console.log('ELECTRON_SMOKE_PASS', JSON.stringify(result));
             if (process.env.WEHELP_SMOKE_SCREENSHOT)
