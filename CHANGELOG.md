@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.2 — capture permission repair
+
+- Handle Electron display-capture permission separately from camera/microphone media permission.
+- Keep display sharing behind a trusted-frame check and explicit consent dialog; camera requests remain denied.
+- Pair permission checks with request handling, preserve microphone confirmation, and recheck the frame after consent.
+- Show input-specific permission guidance on Home.
+- Add permission-policy regression tests and real Electron display-capture consent/cancellation smoke coverage.
+
 ## 2.0.1 — session startup repair
 
 - Wait for secure key persistence before Start, including keyboard starts without blur.

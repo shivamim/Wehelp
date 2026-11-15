@@ -237,6 +237,7 @@ async function startCapture(_interval = 5, imageQuality = 'medium') {
         cheatingDaddy.setStatus('Ready for text — no audio capture');
         return true;
     }
+    let captureTarget = 'screen/system audio';
     try {
         if (mode !== 'mic_only') {
             if (isMacOS) {
@@ -255,6 +256,7 @@ async function startCapture(_interval = 5, imageQuality = 'medium') {
             }
         }
         if (mode === 'mic_only' || mode === 'both') {
+            captureTarget = 'microphone';
             const stream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     sampleRate: SAMPLE_RATE,
@@ -280,7 +282,15 @@ async function startCapture(_interval = 5, imageQuality = 'medium') {
     } catch (error) {
         await stopCapture();
         await ipcRenderer.invoke('close-session');
-        cheatingDaddy.setStatus('Capture error: ' + error.message);
+        const denied =
+            error.name === 'NotAllowedError' ||
+            (error.name === 'AbortError' && captureTarget === 'screen/system audio') ||
+            /permission denied|permission dismissed/i.test(error.message);
+        const help =
+            captureTarget === 'microphone'
+                ? 'Microphone permission was denied. Enable Microphone access and desktop app access in Windows Privacy & security settings, then approve the WeHelp microphone prompt.'
+                : 'Screen/system-audio sharing was denied or cancelled. Start again and choose Share primary display in the WeHelp prompt. Choose Microphone Only in Settings if you only need your microphone.';
+        cheatingDaddy.setStatus(denied ? help : 'Capture error (' + captureTarget + '): ' + error.message);
         return false;
     }
 }
