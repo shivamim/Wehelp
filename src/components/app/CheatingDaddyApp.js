@@ -628,6 +628,8 @@ export class CheatingDaddyApp extends LitElement {
     async handleStart() {
         if (this._startingSession) return;
         this._startingSession = true;
+        this.setStatus('Starting session...');
+        this.requestUpdate();
         try {
             const prefs = await cheatingDaddy.storage.getPreferences();
             const providerMode = prefs.providerMode === 'cloud' ? 'byok' : prefs.providerMode || 'byok';
@@ -663,6 +665,7 @@ export class CheatingDaddyApp extends LitElement {
                 const apiKey = await cheatingDaddy.storage.getApiKey();
                 const runtime = await cheatingDaddy.storage.getConfig();
                 if ((!apiKey || apiKey === '') && runtime.transcriptionProvider !== 'groq' && prefs.audioMode !== 'text_only') {
+                    this.setStatus('Error: No Gemini key is saved. Add it or select Groq transcription / Text Only.');
                     const mainView = this.shadowRoot.querySelector('main-view');
                     if (mainView && mainView.triggerApiKeyError) {
                         mainView.triggerApiKeyError();
@@ -684,6 +687,7 @@ export class CheatingDaddyApp extends LitElement {
             this.setStatus('Error: ' + error.message);
         } finally {
             this._startingSession = false;
+            this.requestUpdate();
         }
     }
 
@@ -784,6 +788,8 @@ export class CheatingDaddyApp extends LitElement {
                 return html`
                     <main-view
                         .selectedProfile=${this.selectedProfile}
+                        .sessionStatus=${this.statusText}
+                        .isInitializing=${this._startingSession || this._sessionInitializing}
                         .onProfileChange=${p => this.handleProfileChange(p)}
                         .onStart=${() => this.handleStart()}
                         .onExternalLink=${url => this.handleExternalLinkClick(url)}

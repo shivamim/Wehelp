@@ -690,6 +690,7 @@ export class MainView extends LitElement {
         selectedProfile: { type: String },
         onProfileChange: { type: Function },
         isInitializing: { type: Boolean },
+        sessionStatus: { type: String },
         whisperDownloading: { type: Boolean },
         downloadProgress: { type: Object },
         onCancelDownload: { type: Function },
@@ -935,33 +936,35 @@ export class MainView extends LitElement {
         this.requestUpdate();
     }
 
-    async _saveGeminiKey(val) {
-        this._geminiKey = val;
-        this._hasGeminiKey = !!val;
-        this._keyError = false;
+    async _saveCredential(provider, val) {
+        this._pendingKeySaves ||= new Set();
+        const task = Promise.resolve().then(() =>
+            provider === 'gemini' ? cheatingDaddy.storage.setApiKey(val) : cheatingDaddy.storage.setGroqApiKey(val)
+        );
+        this._pendingKeySaves.add(task);
         try {
-            await cheatingDaddy.storage.setApiKey(val);
-            this._geminiKey = '';
+            await task;
+            if (provider === 'gemini') {
+                this._hasGeminiKey = !!val.trim();
+                this._geminiKey = '';
+                this._keyError = false;
+            } else {
+                this._hasGroqKey = !!val.trim();
+                this._groqKey = '';
+            }
             this._credentialError = '';
         } catch (error) {
             this._credentialError = error.message;
-            this._hasGeminiKey = false;
+        } finally {
+            this._pendingKeySaves.delete(task);
+            this.requestUpdate();
         }
-        this.requestUpdate();
     }
-
+    async _saveGeminiKey(val) {
+        return this._saveCredential('gemini', val);
+    }
     async _saveGroqKey(val) {
-        this._groqKey = val;
-        this._hasGroqKey = !!val;
-        try {
-            await cheatingDaddy.storage.setGroqApiKey(val);
-            this._groqKey = '';
-            this._credentialError = '';
-        } catch (error) {
-            this._credentialError = error.message;
-            this._hasGroqKey = false;
-        }
-        this.requestUpdate();
+        return this._saveCredential('groq', val);
     }
 
     async _saveGeminiLiveModel(val) {
@@ -1039,26 +1042,40 @@ export class MainView extends LitElement {
     // ── Start ──
 
     async _handleStart() {
-        if (this.isInitializing || this.downloadProgress.active) return;
+        if (this.isInitializing || this.downloadProgress.active || this._starting) return;
+        this._starting = true;
+        try {
+            await Promise.allSettled([...(this._pendingKeySaves || [])]);
+            // Enter may start a session before a password field loses focus.
+            if (this._geminiKey.trim()) await this._saveGeminiKey(this._geminiKey);
+            if (this._groqKey.trim()) await this._saveGroqKey(this._groqKey);
+            if (this._credentialError) return;
 
-        if (this._mode === 'byok') {
-            if (
-                !this._geminiKey.trim() &&
-                !this._hasGeminiKey &&
-                this.shadowRoot.querySelector('engine-settings')?.config.transcriptionProvider !== 'groq' &&
-                (await cheatingDaddy.storage.getPreferences()).audioMode !== 'text_only'
-            ) {
-                this._keyError = true;
-                this.requestUpdate();
-                return;
+            if (this._mode === 'byok') {
+                if (
+                    !this._geminiKey.trim() &&
+                    !this._hasGeminiKey &&
+                    this.shadowRoot.querySelector('engine-settings')?.config.transcriptionProvider !== 'groq' &&
+                    (await cheatingDaddy.storage.getPreferences()).audioMode !== 'text_only'
+                ) {
+                    this._keyError = true;
+                    this._credentialError = 'Add a Gemini key, or choose Groq transcription / Text Only in Settings.';
+                    this.requestUpdate();
+                    return;
+                }
+            } else if (this._mode === 'local') {
+                if (!this._localLlmModel.trim()) {
+                    return;
+                }
             }
-        } else if (this._mode === 'local') {
-            if (!this._localLlmModel.trim()) {
-                return;
-            }
+
+            await this.onStart();
+        } catch (error) {
+            this._credentialError = error.message;
+        } finally {
+            this._starting = false;
+            this.requestUpdate();
         }
-
-        this.onStart();
     }
 
     triggerApiKeyError() {
@@ -1123,6 +1140,8 @@ export class MainView extends LitElement {
         </svg>`;
 
         return html`
+            ${this.sessionStatus ? html`<p role="status" aria-live="polite">${this.sessionStatus}</p>` : ''}
+            ${this._hasGeminiKey || this._hasGroqKey ? html`<p class="form-hint">${this._hasGeminiKey ? 'Gemini key saved securely. ' : ''}${this._hasGroqKey ? 'Groq key saved securely.' : ''}</p>` : ''}
             <button
                 class="start-button ${this.isInitializing || isDownloading ? 'disabled' : ''}"
                 ?disabled=${this.isInitializing || isDownloading}
@@ -1139,7 +1158,7 @@ export class MainView extends LitElement {
                         : ''
                 }
                 <span class="btn-label">
-                    ${isDownloading ? (hasPercentage ? `${percentage}%` : 'Preparing...') : 'Start Session'}
+                    ${isDownloading ? (hasPercentage ? `${percentage}%` : 'Preparing...') : this.isInitializing ? 'Starting session...' : 'Start Session'}
                     ${isDownloading ? '' : html`<span class="shortcut-hint">${isMac ? cmdIcon : ctrlIcon}${enterIcon}</span>`}
                 </span>
             </button>
@@ -1204,6 +1223,9 @@ export class MainView extends LitElement {
                             type="password"
                             placeholder=${this._hasGeminiKey ? 'Saved securely — enter to replace' : 'Required for Gemini'}
                             .value=${this._geminiKey}
+                            @input=${e => {
+                                this._geminiKey = e.target.value;
+                            }}
                             @change=${e => this._saveGeminiKey(e.target.value)}
                             class=${this._keyError ? 'error' : ''}
                         />
@@ -1230,6 +1252,9 @@ export class MainView extends LitElement {
                             type="password"
                             placeholder=${this._hasGroqKey ? 'Saved securely — enter to replace' : 'Optional'}
                             .value=${this._groqKey}
+                            @input=${e => {
+                                this._groqKey = e.target.value;
+                            }}
                             @change=${e => this._saveGroqKey(e.target.value)}
                         />
                         <div class="form-hint">

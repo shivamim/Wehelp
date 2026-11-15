@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.1 — session startup repair
+
+- Wait for secure key persistence before Start, including keyboard starts without blur.
+- Show an explicit saved-key message after clearing password fields.
+- Surface actual Live/model errors on Home instead of silently returning or replacing them with a generic status.
+- Show startup progress, disable duplicate starts, and re-enable Start after failure.
+- Add regression tests for pending key saves, secure-store failures and provider handshake errors; Electron smoke now verifies the Home error is visible.
+
 ## 2.0.0 — release candidate
 
 - Preserve the existing WeHelp Electron/Lit interface, prompts, shortcuts and history; update product metadata and retain GPL attribution.

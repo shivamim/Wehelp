@@ -146,14 +146,12 @@ async function initializeGemini(profile = 'interview', language = 'en-US') {
     const apiKey = await storage.getApiKey();
     if (apiKey || (await storage.getConfig()).transcriptionProvider === 'groq' || (await storage.getPreferences()).audioMode === 'text_only') {
         const prefs = await storage.getPreferences();
-        const success = await ipcRenderer.invoke('initialize-gemini', apiKey, prefs.customPrompt || '', profile, language);
-        if (success) {
+        const result = await ipcRenderer.invoke('initialize-gemini', apiKey, prefs.customPrompt || '', profile, language);
+        if (result === true || result?.success) {
             cheatingDaddy.setStatus('Live');
             return true;
-        } else {
-            cheatingDaddy.setStatus('error');
-            return false;
         }
+        throw new Error(result?.error || 'Session could not start. Check the selected model and API key.');
     }
 }
 

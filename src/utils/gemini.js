@@ -59,6 +59,12 @@ let currentProfile = null;
 let currentCustomPrompt = null;
 let isInitializingSession = false;
 let sessionStartPending = false;
+let lastInitializationError = '';
+function liveStartFailure(message) {
+    lastInitializationError = message;
+    sendToRenderer('update-status', 'Session could not start: ' + message);
+    return null;
+}
 let currentSystemPrompt = null;
 
 function formatSpeakerResults(results) {
@@ -304,11 +310,12 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
 
     // Normalize the key once at the boundary — silently fixes trailing spaces /
     // quotes pasted from docs, which is a top cause of "invalid API key" errors.
+    lastInitializationError = '';
     const normalizedKey = normalizeKey(apiKey);
     if (!normalizedKey) {
         sendToRenderer('update-status', 'No Gemini API key configured. Add it in Settings.');
         sendToRenderer('api-key-problem', { provider: 'gemini', status: 0, message: 'No Gemini API key configured' });
-        return null;
+        return liveStartFailure('No Gemini API key is saved. Add it and try again.');
     }
     if (!isReconnect && normalizedKey !== apiKey) {
         setApiKey(normalizedKey); // persist the cleaned version
@@ -320,7 +327,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         if (shapeError) {
             sendToRenderer('update-status', shapeError);
             sendToRenderer('api-key-problem', { provider: 'gemini', status: 0, message: shapeError });
-            return null;
+            return liveStartFailure(shapeError);
         }
         // Authentication is checked by the Live handshake; no extra models
         // round trip is required on the critical startup path.
@@ -347,8 +354,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
     } catch (error) {
         isInitializingSession = false;
         sendToRenderer('session-initializing', false);
-        sendToRenderer('update-status', error.message);
-        return null;
+        return liveStartFailure(error.message);
     }
     const client = getGenaiClient(normalizedKey, { httpOptions: { apiVersion: 'v1beta' } });
 
@@ -437,6 +443,8 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                         return;
                     }
 
+                    // Initial handshake failures are returned to Home, not retried in the background.
+                    if (isInitializingSession) return;
                     // Attempt reconnection
                     if (sessionParams && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
                         attemptReconnect();
@@ -502,7 +510,8 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         }
         return session;
     } catch (error) {
-        console.error('Failed to initialize Gemini session:', String(error.message || '').replaceAll(normalizedKey, '[redacted]'));
+        const message = String(error.message || 'Gemini Live connection failed').replaceAll(normalizedKey, '[redacted]');
+        liveStartFailure(`Gemini model ${liveModel}: ${message}`);
         isInitializingSession = false;
         if (!isReconnect) {
             sendToRenderer('session-initializing', false);
@@ -816,7 +825,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     });
 
     ipcMain.handle('initialize-gemini', async (event, _key, customPrompt, profile = 'interview', language = 'en-US') => {
-        if (isInitializingSession || sessionStartPending) return false;
+        if (isInitializingSession || sessionStartPending) return { success: false, error: 'A session is already starting. Please wait.' };
         sessionStartPending = true;
         try {
             await shutdownSession();
@@ -827,17 +836,17 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             if (config.performanceMode === 'offline' || config.responseProvider === 'local') throw new Error('Select Local AI to use Offline mode');
             if (require('../storage').getPreferences().audioMode === 'text_only') {
                 initializeNewSession(profile, customPrompt);
-                return true;
+                return { success: true };
             }
             if (config.transcriptionProvider === 'groq' && config.performanceMode !== 'live-voice') {
                 if (!getGroqApiKey()) throw new Error('Groq transcription requires a Groq key');
                 initializeNewSession(profile, customPrompt);
-                return true;
+                return { success: true };
             }
             const session = await initializeGeminiSession(getApiKey(), customPrompt, profile, language);
-            if (!session) return false;
+            if (!session) return { success: false, error: lastInitializationError || 'Gemini Live connection was cancelled. Try again.' };
             geminiSessionRef.current = session;
-            return true;
+            return { success: true };
         } finally {
             sessionStartPending = false;
         }
