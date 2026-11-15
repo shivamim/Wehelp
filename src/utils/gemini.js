@@ -156,6 +156,10 @@ function getGenaiClient(apiKey, options = {}) {
 }
 
 function emitStreamText(id, fullText) {
+    if (!lastEmittedSnapshot.has(id)) {
+        sendStreamSnapshot(id, fullText);
+        return;
+    }
     pendingStreamText.set(id, fullText);
     if (!streamFlushTimers.has(id)) {
         const timer = setTimeout(() => {
@@ -454,6 +458,7 @@ async function sendToGroq(transcription) {
         return;
     }
 
+    const streamId = `groq-text-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const config = getConfig();
     const modelToUse = config.groqModel;
 
@@ -825,7 +830,6 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     sendToRenderer('update-status', 'Live session connected');
                 },
                 onmessage: function (message) {
-                    console.log('----------------', message);
                     logTransportEvent('gemini.live.message', message);
 
                     // Handle input transcription (what was spoken)
@@ -838,7 +842,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                         }
                     }
 
-                    if (message.serverContent?.inputTranscription) {
+                    if (message.serverContent?.inputTranscription?.finished) {
                         sendFinalTranscriptionToGroq();
                     }
 
@@ -849,6 +853,8 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     }
 
                     if (message.serverContent?.generationComplete) {
+                        // Older Live models may omit transcription.finished.
+                        sendFinalTranscriptionToGroq();
                         if (currentTranscription.trim() !== '') {
                             if (!hasGroqKey() && messageBuffer.trim() !== '') {
                                 saveConversationTurn(currentTranscription, messageBuffer);
@@ -859,6 +865,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     }
 
                     if (message.serverContent?.turnComplete) {
+                        sendFinalTranscriptionToGroq();
                         currentTranscription = '';
                         messageBuffer = '';
                         groqRequestStartedForTurn = false;
@@ -896,6 +903,13 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                 },
             },
             config: {
+                realtimeInputConfig: {
+                    automaticActivityDetection: {
+                        disabled: false,
+                        prefixPaddingMs: 100,
+                        silenceDurationMs: 300,
+                    },
+                },
                 responseModalities: [Modality.AUDIO],
                 proactivity: { proactiveAudio: true },
                 outputAudioTranscription: {},
