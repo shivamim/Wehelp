@@ -1,5 +1,7 @@
+import { ipcRenderer } from '../../utils/bridge.js';
 import { html, css, LitElement } from '../../assets/lit-core-2.7.4.min.js';
-import StreamingMarkdownRenderer from '../../utils/streamingRenderer.js';
+import '../../utils/streamingRenderer.js';
+const StreamingMarkdownRenderer = globalThis.StreamingMarkdownRenderer;
 
 export class AssistantView extends LitElement {
     static styles = css`
@@ -66,12 +68,22 @@ export class AssistantView extends LitElement {
             font-weight: var(--font-weight-semibold);
         }
 
-        .response-container h1 { font-size: 1.5em; }
-        .response-container h2 { font-size: 1.3em; }
-        .response-container h3 { font-size: 1.15em; }
-        .response-container h4 { font-size: 1.05em; }
+        .response-container h1 {
+            font-size: 1.5em;
+        }
+        .response-container h2 {
+            font-size: 1.3em;
+        }
+        .response-container h3 {
+            font-size: 1.15em;
+        }
+        .response-container h4 {
+            font-size: 1.05em;
+        }
         .response-container h5,
-        .response-container h6 { font-size: 1em; }
+        .response-container h6 {
+            font-size: 1em;
+        }
 
         .response-container p {
             margin: 0.6em 0;
@@ -275,7 +287,9 @@ export class AssistantView extends LitElement {
             display: flex;
             align-items: center;
             gap: 4px;
-            transition: border-color 0.4s ease, background var(--transition);
+            transition:
+                border-color 0.4s ease,
+                background var(--transition);
             flex-shrink: 0;
             overflow: hidden;
         }
@@ -328,6 +342,7 @@ export class AssistantView extends LitElement {
         this.selectedProfile = 'interview';
         this.onSendText = () => {};
         this.isAnalyzing = false;
+        this._audioActive = false;
         this._animFrame = null;
 
         // Incremental streaming renderer: appends new text in place, throttles
@@ -368,7 +383,11 @@ export class AssistantView extends LitElement {
                     gfm: true,
                     sanitize: false,
                 });
-                let rendered = window.marked.parse(content);
+                let rendered = window.DOMPurify.sanitize(window.marked.parse(content), {
+                    USE_PROFILES: { html: true },
+                    FORBID_TAGS: ['style', 'iframe', 'form'],
+                    FORBID_ATTR: ['style'],
+                });
                 rendered = this.wrapWordsInSpans(rendered);
                 return rendered;
             } catch (error) {
@@ -450,9 +469,7 @@ export class AssistantView extends LitElement {
     connectedCallback() {
         super.connectedCallback();
 
-        if (window.require) {
-            const { ipcRenderer } = window.require('electron');
-
+        if (window.wehelp) {
             this.handlePreviousResponse = () => this.navigateToPreviousResponse();
             this.handleNextResponse = () => this.navigateToNextResponse();
             this.handleScrollUp = () => this.scrollResponseUp();
@@ -471,6 +488,15 @@ export class AssistantView extends LitElement {
                 }
             };
 
+            this.handleCaptureState = (_event, state) => {
+                this._audioActive = state.active;
+                this.requestUpdate();
+            };
+            ipcRenderer.on('capture-state', this.handleCaptureState);
+            ipcRenderer.invoke('performance:snapshot').then(metrics => {
+                this._audioActive = !!metrics.audioCaptureActive;
+                this.requestUpdate();
+            });
             ipcRenderer.on('navigate-previous-response', this.handlePreviousResponse);
             ipcRenderer.on('navigate-next-response', this.handleNextResponse);
             ipcRenderer.on('scroll-response-up', this.handleScrollUp);
@@ -488,8 +514,8 @@ export class AssistantView extends LitElement {
         this._lastRenderedIndex = -1;
         this._lastRenderedResponseCount = 0;
 
-        if (window.require) {
-            const { ipcRenderer } = window.require('electron');
+        if (window.wehelp) {
+            if (this.handleCaptureState) ipcRenderer.removeListener('capture-state', this.handleCaptureState);
             if (this.handlePreviousResponse) ipcRenderer.removeListener('navigate-previous-response', this.handlePreviousResponse);
             if (this.handleNextResponse) ipcRenderer.removeListener('navigate-next-response', this.handleNextResponse);
             if (this.handleScrollUp) ipcRenderer.removeListener('scroll-response-up', this.handleScrollUp);
@@ -549,7 +575,7 @@ export class AssistantView extends LitElement {
         const perimeter = 2 * straightLen + 2 * arcLen;
 
         // Given a distance along the perimeter, return {x, y, nx, ny} (position + inward normal)
-        const pointOnPerimeter = (d) => {
+        const pointOnPerimeter = d => {
             d = ((d % perimeter) + perimeter) % perimeter;
             // Top straight: left to right
             if (d < straightLen) {
@@ -588,7 +614,7 @@ export class AssistantView extends LitElement {
             seeds.push({ pos: Math.random(), drift: Math.random(), depthSeed: Math.random() });
         }
 
-        const draw = (now) => {
+        const draw = now => {
             const elapsed = (now - startTime) / 1000;
             const fade = Math.min(1, elapsed / FADE_IN);
 
@@ -661,6 +687,8 @@ export class AssistantView extends LitElement {
     }
 
     scrollToBottom() {
+        const current = this.shadowRoot.querySelector('.response-container');
+        if (current && current.scrollHeight - current.scrollTop - current.clientHeight > 100) return;
         setTimeout(() => {
             const container = this.shadowRoot.querySelector('.response-container');
             if (container) {
@@ -726,6 +754,10 @@ export class AssistantView extends LitElement {
         const isNewResponse = count !== this._lastRenderedResponseCount || index !== this._lastRenderedIndex;
         const sameText = !isNewResponse && text === this._lastRenderedText;
 
+        if (sameText && this._isStreamingResponse && !this._lastResponseIsStreaming()) {
+            renderer.finalize(text);
+            this._isStreamingResponse = false;
+        }
         if (!sameText) {
             renderer.setActive(index >= 0 ? index : 0);
             if (this._lastResponseIsStreaming()) {
@@ -759,36 +791,77 @@ export class AssistantView extends LitElement {
         return html`
             <div class="response-container" id="responseContainer"></div>
 
-            ${hasMultipleResponses ? html`
-                <div class="response-nav">
-                    <button class="nav-btn" @click=${this.navigateToPreviousResponse} ?disabled=${this.currentResponseIndex <= 0} title="Previous response">
-                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                            <path fill-rule="evenodd" d="M11.78 5.22a.75.75 0 0 1 0 1.06L8.06 10l3.72 3.72a.75.75 0 1 1-1.06 1.06l-4.25-4.25a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 0Z" clip-rule="evenodd" />
-                        </svg>
-                    </button>
-                    <span class="response-counter">${this.currentResponseIndex + 1} of ${this.responses.length}</span>
-                    <button class="nav-btn" @click=${this.navigateToNextResponse} ?disabled=${this.currentResponseIndex >= this.responses.length - 1} title="Next response">
-                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                            <path fill-rule="evenodd" d="M8.22 5.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
-                        </svg>
-                    </button>
-                </div>
-            ` : ''}
+            ${
+                hasMultipleResponses
+                    ? html`
+                          <div class="response-nav">
+                              <button
+                                  class="nav-btn"
+                                  @click=${this.navigateToPreviousResponse}
+                                  ?disabled=${this.currentResponseIndex <= 0}
+                                  title="Previous response"
+                              >
+                                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                                      <path
+                                          fill-rule="evenodd"
+                                          d="M11.78 5.22a.75.75 0 0 1 0 1.06L8.06 10l3.72 3.72a.75.75 0 1 1-1.06 1.06l-4.25-4.25a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 0Z"
+                                          clip-rule="evenodd"
+                                      />
+                                  </svg>
+                              </button>
+                              <span class="response-counter">${this.currentResponseIndex + 1} of ${this.responses.length}</span>
+                              <button
+                                  class="nav-btn"
+                                  @click=${this.navigateToNextResponse}
+                                  ?disabled=${this.currentResponseIndex >= this.responses.length - 1}
+                                  title="Next response"
+                              >
+                                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                                      <path
+                                          fill-rule="evenodd"
+                                          d="M8.22 5.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 0 1 0-1.06Z"
+                                          clip-rule="evenodd"
+                                      />
+                                  </svg>
+                              </button>
+                          </div>
+                      `
+                    : ''
+            }
 
             <div class="input-bar">
                 <div class="input-bar-inner">
-                    <input
-                        type="text"
-                        id="textInput"
-                        placeholder="Type a message..."
-                        @keydown=${this.handleTextKeydown}
-                    />
+                    <input type="text" id="textInput" placeholder="Type a message..." @keydown=${this.handleTextKeydown} />
                 </div>
+                <button class="analyze-btn" @click=${() => ipcRenderer.invoke('cancel-request')}>Cancel answer</button>
+                <button
+                    class="analyze-btn"
+                    @click=${async () => {
+                        if (this._capturePaused) {
+                            await cheatingDaddy.startCapture();
+                            this._capturePaused = false;
+                        } else {
+                            await cheatingDaddy.pauseCapture();
+                            this._capturePaused = true;
+                        }
+                        this.requestUpdate();
+                    }}
+                >
+                    ${this._capturePaused ? 'Resume audio' : 'Pause audio'}
+                </button>
+                <span role="status">${this._audioActive ? 'Audio capture active' : 'No audio capture'}</span>
                 <button class="analyze-btn ${this.isAnalyzing ? 'analyzing' : ''}" @click=${this.handleScreenAnswer}>
                     <canvas class="analyze-canvas"></canvas>
                     <span class="analyze-btn-content">
                         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24">
-                            <path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 3v7h6l-8 11v-7H5z" />
+                            <path
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                stroke-width="2"
+                                d="M13 3v7h6l-8 11v-7H5z"
+                            />
                         </svg>
                         Analyze Screen
                     </span>

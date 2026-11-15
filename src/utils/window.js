@@ -20,51 +20,62 @@ function createWindow(sendToRenderer, geminiSessionRef) {
         frame: false,
         transparent: true,
         hasShadow: false,
-        alwaysOnTop: process.platform === 'win32',
+        title: 'WeHelp',
+        alwaysOnTop: storage.getConfig().alwaysOnTop === true,
         webPreferences: {
-            nodeIntegration: true,
-            contextIsolation: false, // TODO: change to true
-            backgroundThrottling: false,
-            enableBlinkFeatures: 'GetDisplayMedia',
+            preload: path.join(__dirname, '../preload.js'),
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: true,
+            backgroundThrottling: true,
             webSecurity: true,
             allowRunningInsecureContent: false,
         },
         backgroundColor: '#00000000',
     });
 
-    const { session, desktopCapturer } = require('electron');
-    session.defaultSession.setDisplayMediaRequestHandler(
-        (request, callback) => {
-            desktopCapturer.getSources({ types: ['screen'] }).then(sources => {
-                callback({ video: sources[0], audio: 'loopback' });
+    const { session, desktopCapturer, dialog } = require('electron');
+    const { pathToFileURL } = require('node:url');
+    const trustedURL = pathToFileURL(path.join(__dirname, '../index.html')).href;
+    mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    mainWindow.webContents.on('will-navigate', event => event.preventDefault());
+    session.defaultSession.setPermissionRequestHandler(async (contents, permission, callback, details) => {
+        if (
+            contents !== mainWindow.webContents ||
+            contents.getURL() !== trustedURL ||
+            permission !== 'media' ||
+            details.mediaTypes?.includes('video')
+        )
+            return callback(false);
+        const result = await dialog.showMessageBox(mainWindow, {
+            type: 'question',
+            buttons: ['Allow microphone', 'Cancel'],
+            defaultId: 1,
+            cancelId: 1,
+            message: 'Allow WeHelp to capture microphone audio for this session?',
+            detail: 'Audio is sent to your selected provider. Stop Session ends capture.',
+        });
+        callback(result.response === 0);
+    });
+    session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
+        if (request.frame !== mainWindow.webContents.mainFrame || mainWindow.webContents.getURL() !== trustedURL) return callback({});
+        try {
+            const result = await dialog.showMessageBox(mainWindow, {
+                type: 'question',
+                buttons: ['Share primary display', 'Cancel'],
+                defaultId: 1,
+                cancelId: 1,
+                message: request.audioRequested ? 'Share primary display and system audio with WeHelp?' : 'Share primary display with WeHelp?',
+                detail: 'Screenshots are analyzed only when you request them. System audio is sent to the selected provider while the session is active.',
             });
-        },
-        { useSystemPicker: true }
-    );
-
-    mainWindow.setContentProtection(true);
-    if (process.platform === 'win32') {
-        mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-        mainWindow.setAlwaysOnTop(true, 'screen-saver', 1);
-    }
-
-    // Hide from Windows taskbar
-    if (process.platform === 'win32') {
-        try {
-            mainWindow.setSkipTaskbar(true);
+            if (result.response !== 0) return callback({});
+            const sources = await desktopCapturer.getSources({ types: ['screen'] });
+            callback(sources[0] ? { video: sources[0], ...(request.audioRequested ? { audio: 'loopback' } : {}) } : {});
         } catch (error) {
-            console.warn('Could not hide from taskbar:', error.message);
+            console.error('Display capture failed:', error.message);
+            callback({});
         }
-    }
-
-    // Hide from Mission Control on macOS
-    if (process.platform === 'darwin') {
-        try {
-            mainWindow.setHiddenInMissionControl(true);
-        } catch (error) {
-            console.warn('Could not hide from Mission Control:', error.message);
-        }
-    }
+    });
 
     mainWindow.loadFile(path.join(__dirname, '../index.html'));
 
@@ -199,9 +210,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
                     const shortcutKey = isMac ? 'cmd+enter' : 'ctrl+enter';
 
                     // Use the new handleShortcut function
-                    mainWindow.webContents.executeJavaScript(`
-                        cheatingDaddy.handleShortcut('${shortcutKey}');
-                    `);
+                    mainWindow.webContents.send('shortcut', shortcutKey);
                 } catch (error) {
                     console.error('Error handling next step shortcut:', error);
                 }
@@ -293,14 +302,11 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
 }
 
 function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
+    for (const channel of ['view-changed', 'update-keybinds']) ipcMain.removeAllListeners(channel);
     ipcMain.on('view-changed', (event, view) => {
         if (!mainWindow.isDestroyed()) {
             const isLiveMode = view === 'assistant';
-
-            if (process.platform !== 'win32') {
-                mainWindow.setAlwaysOnTop(isLiveMode);
-                mainWindow.setVisibleOnAllWorkspaces(isLiveMode, { visibleOnFullScreen: isLiveMode });
-            }
+            mainWindow.setTitle(isLiveMode ? 'WeHelp — session active' : 'WeHelp');
 
             if (!isLiveMode) {
                 mainWindow.setIgnoreMouseEvents(false);
@@ -308,6 +314,7 @@ function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
         }
     });
 
+    for (const channel of ['window-minimize', 'toggle-window-visibility']) ipcMain.removeHandler(channel);
     ipcMain.handle('window-minimize', () => {
         if (!mainWindow.isDestroyed()) {
             mainWindow.minimize();
@@ -316,6 +323,7 @@ function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
 
     ipcMain.on('update-keybinds', (event, newKeybinds) => {
         if (!mainWindow.isDestroyed()) {
+            storage.setKeybinds(newKeybinds);
             updateGlobalShortcuts(newKeybinds, mainWindow, sendToRenderer, geminiSessionRef);
         }
     });

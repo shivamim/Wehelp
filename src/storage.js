@@ -2,42 +2,23 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const CONFIG_VERSION = 1;
+const CONFIG_VERSION = 2;
 
 // ── Gemini model catalog ─────────────────────────────────────────────────────
 // Keep this list ordered fastest-first — the UI dropdown and the migration
 // logic below both rely on that ordering.
-const GEMINI_LIVE_MODELS = [
-    // Current-gen Live API models (audio in / audio+text out).
-    'gemini-3.1-flash-live-preview', // default: best latency/quality balance
-    'gemini-3-flash-live-preview',
-    'gemini-3.1-pro-live-preview', // highest quality, slightly slower
-    'gemini-2.5-flash-native-audio-preview-12-2025',
-    'gemini-2.5-flash-preview-tts',
-    // Previous generation — still supported, kept for fallback.
-    'gemini-2.5-flash-live-preview',
-    'gemini-2.0-flash-live-0125',
-];
-
-const GEMINI_CHAT_MODELS = [
-    // Text/vision models used for screen analysis + answers.
-    'gemini-3-flash', // fast, strong vision — great for screenshots
-    'gemini-3.1-flash-lite', // cheapest / lowest latency
-    'gemini-3-pro', // highest quality
-    'gemini-2.5-flash',
-    'gemini-2.5-flash-lite',
-    'gemini-2.5-pro',
-];
-
-// Retired/renamed model ids → modern equivalents. Applied when loading config
-// so users with old saved values never hit "model not found" errors.
+const { ModelRegistry } = require('./engine/model-registry');
+const catalog = new ModelRegistry();
+const GEMINI_LIVE_MODELS = catalog
+    .list('live')
+    .filter(m => m.provider === 'gemini')
+    .map(m => m.id);
+const GEMINI_CHAT_MODELS = catalog
+    .list('text')
+    .filter(m => m.provider === 'gemini')
+    .map(m => m.id);
 const LEGACY_GEMINI_MODEL_MAP = {
-    'gemini-2.0-flash-live-preview-04-09': 'gemini-2.0-flash-live-0125',
-    'gemini-2.5-flash-preview-tts': 'gemini-2.5-flash-native-audio-preview-12-2025',
-    'gemini-live-2.5-flash-native-audio': 'gemini-2.5-flash-native-audio-preview-12-2025',
-    'gemini-flash-latest': 'gemini-3-flash',
-    'gemini-flash-lite-latest': 'gemini-3.1-flash-lite',
-    'gemini-pro-latest': 'gemini-3-pro',
+    'gemini-2.5-flash-preview-tts': 'gemini-3.1-flash-live-preview',
 };
 
 // Default values
@@ -46,10 +27,20 @@ const DEFAULT_CONFIG = {
     onboarded: false,
     layout: 'normal',
     geminiLiveModel: 'gemini-3.1-flash-live-preview',
-    geminiChatModel: 'gemini-3-flash',
-    groqModel: 'qwen/qwen3.6-27b',
-    groqImageModel: 'qwen/qwen3.6-27b',
+    geminiChatModel: 'auto',
+    groqModel: 'auto',
+    groqImageModel: 'auto',
     disableGroqThinking: true,
+    performanceMode: 'balanced',
+    responseProvider: 'auto',
+    responseStyle: 'standard',
+    transcriptionProvider: 'gemini',
+    transcriptionModel: 'gemini-3.5-transcribe-live',
+    audioChunkMs: 100,
+    endpointSilenceMs: 700,
+    alwaysOnTop: false,
+    minimizeToTray: true,
+    launchAtLogin: false,
 };
 
 const DEFAULT_CREDENTIALS = {
@@ -81,6 +72,7 @@ const DEFAULT_LIMITS = {
 
 // Get the config directory path based on OS
 function getConfigDir() {
+    if (process.env.WEHELP_DATA_DIR) return path.resolve(process.env.WEHELP_DATA_DIR);
     const platform = os.platform();
     let configDir;
 
@@ -120,8 +112,12 @@ function getHistoryDir() {
     return path.join(getConfigDir(), 'history');
 }
 
+const pendingWrites = new Map();
+const pendingValues = new Map();
+
 // Helper to read JSON file safely
 function readJsonFile(filePath, defaultValue) {
+    if (pendingValues.has(filePath)) return JSON.parse(pendingValues.get(filePath));
     try {
         if (fs.existsSync(filePath)) {
             const data = fs.readFileSync(filePath, 'utf8');
@@ -135,17 +131,35 @@ function readJsonFile(filePath, defaultValue) {
 
 // Helper to write JSON file safely
 function writeJsonFile(filePath, data) {
-    try {
-        const dir = path.dirname(filePath);
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
+    const serialized = JSON.stringify(data, null, 2);
+    pendingValues.set(filePath, serialized);
+    const previous = pendingWrites.get(filePath) || Promise.resolve();
+    const work = previous
+        .catch(() => {})
+        .then(async () => {
+            const temporary = `${filePath}.tmp`;
+            await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+            await fs.promises.writeFile(temporary, serialized, { encoding: 'utf8', mode: 0o600 });
+            await fs.promises.rename(temporary, filePath);
+            return true;
+        });
+    pendingWrites.set(filePath, work);
+    work.then(
+        () => {
+            if (pendingWrites.get(filePath) === work) {
+                pendingWrites.delete(filePath);
+                pendingValues.delete(filePath);
+            }
+        },
+        error => {
+            console.error('Settings persistence failed:', error.message);
         }
-        fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
-        return true;
-    } catch (error) {
-        console.error(`Error writing ${filePath}:`, error.message);
-        return false;
-    }
+    );
+    return work;
+}
+async function flushStorage() {
+    flushLimits();
+    await Promise.all([...pendingWrites.values()]);
 }
 
 // Check if we need to reset (no configVersion or wrong version)
@@ -189,14 +203,16 @@ function resetConfigDir() {
 
 // Initialize storage - call this on app startup
 function initializeStorage() {
-    if (needsReset()) {
-        resetConfigDir();
-    } else {
-        // Ensure history directory exists
-        const historyDir = getHistoryDir();
-        if (!fs.existsSync(historyDir)) {
-            fs.mkdirSync(historyDir, { recursive: true });
-        }
+    // A version change must never erase preferences, keys or conversation history.
+    fs.mkdirSync(getHistoryDir(), { recursive: true });
+    const saved = readJsonFile(getConfigPath(), {});
+    if (Number(saved.configVersion) > CONFIG_VERSION)
+        throw new Error('Settings were saved by a newer WeHelp version; use that version to preserve compatibility');
+    if (saved.configVersion !== CONFIG_VERSION) {
+        if (fs.existsSync(getConfigPath())) fs.copyFileSync(getConfigPath(), getConfigPath() + '.v1-backup');
+        configCache = { ...DEFAULT_CONFIG, ...saved, configVersion: CONFIG_VERSION };
+        _migrateGeminiModels(configCache);
+        writeJsonFile(getConfigPath(), configCache);
     }
 }
 
@@ -324,22 +340,22 @@ function setCredentials(credentials) {
 
 function getApiKey() {
     if (apiKeyManager) return apiKeyManager.getApiKey();
-    return _readLegacySecret('gemini');
+    throw new Error('Secure credential manager has not been initialized');
 }
 
 function setApiKey(apiKey) {
     if (apiKeyManager) return apiKeyManager.setApiKey(apiKey);
-    return _writeLegacySecret('gemini', apiKey);
+    throw new Error('Secure credential manager has not been initialized');
 }
 
 function getGroqApiKey() {
     if (apiKeyManager) return apiKeyManager.getGroqApiKey();
-    return _readLegacySecret('groq');
+    throw new Error('Secure credential manager has not been initialized');
 }
 
 function setGroqApiKey(groqApiKey) {
     if (apiKeyManager) return apiKeyManager.setGroqApiKey(groqApiKey);
-    return _writeLegacySecret('groq', groqApiKey);
+    throw new Error('Secure credential manager has not been initialized');
 }
 
 // ============ PREFERENCES ============
@@ -518,7 +534,8 @@ function incrementCharUsage(provider, model, charCount) {
 // flowing instead of stalling on 429 backoff.
 function getAvailableModel() {
     const config = getConfig();
-    const preferred = typeof config.geminiChatModel === 'string' && config.geminiChatModel.trim() ? config.geminiChatModel.trim() : DEFAULT_CONFIG.geminiChatModel;
+    const preferred =
+        typeof config.geminiChatModel === 'string' && config.geminiChatModel.trim() ? config.geminiChatModel.trim() : DEFAULT_CONFIG.geminiChatModel;
 
     const rotation = [preferred, ...GEMINI_CHAT_MODELS.filter(m => m !== preferred)];
     const todayEntry = getTodayLimits();
@@ -564,6 +581,7 @@ function getModelForToday() {
 // ============ HISTORY ============
 
 function getSessionPath(sessionId) {
+    if (typeof sessionId !== 'string' || !/^[\w-]{1,100}$/.test(sessionId)) throw new Error('Invalid session ID');
     return path.join(getHistoryDir(), `${sessionId}.json`);
 }
 
@@ -587,8 +605,43 @@ function saveSession(sessionId, data) {
     return writeJsonFile(sessionPath, sessionData);
 }
 
+function appendSessionTurn(sessionId, turn) {
+    const filePath = getSessionPath(sessionId) + '.turns.jsonl';
+    const line = JSON.stringify(turn) + '\n';
+    const work = (pendingWrites.get(filePath) || Promise.resolve())
+        .catch(() => {})
+        .then(async () => {
+            await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+            await fs.promises.appendFile(filePath, line, { encoding: 'utf8', mode: 0o600 });
+        });
+    pendingWrites.set(filePath, work);
+    work.then(
+        () => {
+            if (pendingWrites.get(filePath) === work) pendingWrites.delete(filePath);
+        },
+        error => console.error('History append failed:', error.message)
+    );
+    return work;
+}
 function getSession(sessionId) {
-    return readJsonFile(getSessionPath(sessionId), null);
+    const filePath = getSessionPath(sessionId);
+    const data = readJsonFile(filePath, null);
+    if (!data) return null;
+    const journal = filePath + '.turns.jsonl';
+    if (fs.existsSync(journal)) {
+        const turns = [];
+        for (const line of fs.readFileSync(journal, 'utf8').split('\n')) {
+            if (!line.trim()) continue;
+            try {
+                turns.push(JSON.parse(line));
+            } catch {
+                console.warn('Incomplete history journal record retained for recovery');
+            }
+        }
+        data.conversationHistory = [...(data.conversationHistory || []), ...turns];
+        data.lastUpdated = turns.at(-1)?.timestamp || data.lastUpdated;
+    }
+    return data;
 }
 
 function getAllSessions() {
@@ -612,7 +665,7 @@ function getAllSessions() {
         return files
             .map(file => {
                 const sessionId = file.replace('.json', '');
-                const data = readJsonFile(path.join(historyDir, file), null);
+                const data = getSession(sessionId);
                 if (data) {
                     return {
                         sessionId,
@@ -633,9 +686,11 @@ function getAllSessions() {
     }
 }
 
-function deleteSession(sessionId) {
+async function deleteSession(sessionId) {
     const sessionPath = getSessionPath(sessionId);
+    await Promise.all([pendingWrites.get(sessionPath), pendingWrites.get(sessionPath + '.turns.jsonl')]);
     try {
+        await fs.promises.rm(sessionPath + '.turns.jsonl', { force: true });
         if (fs.existsSync(sessionPath)) {
             fs.unlinkSync(sessionPath);
             return true;
@@ -646,11 +701,12 @@ function deleteSession(sessionId) {
     return false;
 }
 
-function deleteAllSessions() {
+async function deleteAllSessions() {
+    await flushStorage();
     const historyDir = getHistoryDir();
     try {
         if (fs.existsSync(historyDir)) {
-            const files = fs.readdirSync(historyDir).filter(f => f.endsWith('.json'));
+            const files = fs.readdirSync(historyDir).filter(f => f.endsWith('.json') || f.endsWith('.turns.jsonl'));
             files.forEach(file => {
                 fs.unlinkSync(path.join(historyDir, file));
             });
@@ -664,14 +720,22 @@ function deleteAllSessions() {
 
 // ============ CLEAR ALL DATA ============
 
-function clearAllData() {
+async function clearAllData() {
+    await flushStorage();
+    if (apiKeyManager) {
+        if (!apiKeyManager.setApiKey('') || !apiKeyManager.setGroqApiKey('')) throw new Error('Could not clear secure credentials');
+    }
+    configCache = null;
+    limitsCache = null;
     resetConfigDir();
+    await flushStorage();
     return true;
 }
 
 module.exports = {
     // Initialization
     initializeStorage,
+    flushStorage,
     getConfigDir,
 
     // Config
@@ -714,6 +778,7 @@ module.exports = {
 
     // History
     saveSession,
+    appendSessionTurn,
     getSession,
     getAllSessions,
     deleteSession,

@@ -1,3 +1,4 @@
+import { ipcRenderer } from '../../utils/bridge.js';
 import { html, css, LitElement } from '../../assets/lit-core-2.7.4.min.js';
 import { MainView } from '../views/MainView.js';
 import { CustomizeView } from '../views/CustomizeView.js';
@@ -421,26 +422,8 @@ export class CheatingDaddyApp extends LitElement {
     }
 
     async _checkForUpdates() {
-        try {
-            this._localVersion = await cheatingDaddy.getVersion();
-            this.requestUpdate();
-
-            const res = await fetch('https://raw.githubusercontent.com/sohzm/cheating-daddy/refs/heads/master/package.json');
-            if (!res.ok) return;
-            const remote = await res.json();
-            const remoteVersion = remote.version;
-
-            const toNum = v => v.split('.').map(Number);
-            const [rMaj, rMin, rPatch] = toNum(remoteVersion);
-            const [lMaj, lMin, lPatch] = toNum(this._localVersion);
-
-            if (rMaj > lMaj || (rMaj === lMaj && rMin > lMin) || (rMaj === lMaj && rMin === lMin && rPatch > lPatch)) {
-                this._updateAvailable = true;
-                this.requestUpdate();
-            }
-        } catch (e) {
-            // silently ignore
-        }
+        this._localVersion = await cheatingDaddy.getVersion();
+        this.requestUpdate();
     }
 
     async _loadFromStorage() {
@@ -466,8 +449,55 @@ export class CheatingDaddyApp extends LitElement {
     connectedCallback() {
         super.connectedCallback();
 
-        if (window.require) {
-            const { ipcRenderer } = window.require('electron');
+        if (window.wehelp) {
+            this._streams = new Map();
+            ipcRenderer.on('response-stream', (_event, event) => {
+                if (event.type === 'start') {
+                    this._streams.clear();
+                    this._streams.set(event.requestId, { sequence: event.sequence, text: '', index: null, rendered: false });
+                    this.setStatus('Generating response...');
+                    return;
+                }
+                const stream = this._streams.get(event.requestId);
+                if (!stream || event.sequence <= stream.sequence) return;
+                stream.sequence = event.sequence;
+                if (event.type === 'delta') {
+                    stream.text += event.delta;
+                    if (stream.index === null) {
+                        this.addNewResponse(stream.text);
+                        stream.index = this.responses.length - 1;
+                    } else {
+                        const next = [...this.responses];
+                        next[stream.index] = stream.text;
+                        this.responses = next;
+                    }
+                    if (!stream.rendered && this.currentView === 'assistant' && this.currentResponseIndex === stream.index && !document.hidden) {
+                        stream.rendered = true;
+                        this.updateComplete.then(() =>
+                            requestAnimationFrame(() =>
+                                requestAnimationFrame(() => {
+                                    if (this.currentView === 'assistant' && this.currentResponseIndex === stream.index && !document.hidden)
+                                        ipcRenderer.invoke('performance:rendered', event.requestId);
+                                })
+                            )
+                        );
+                    }
+                } else {
+                    this.setStatus(
+                        event.type === 'error' ? 'Error: ' + event.message : event.type === 'cancelled' ? 'Request cancelled' : 'Listening...'
+                    );
+                    this._streams.delete(event.requestId);
+                }
+            });
+            ipcRenderer.on('session-initializing', (_event, active) => {
+                this._sessionInitializing = active;
+                this.requestUpdate();
+            });
+            ipcRenderer.on('capture-stopped', () => {
+                this.sessionActive = false;
+                this._stopTimer();
+                if (this.currentView === 'assistant') this.currentView = 'main';
+            });
             ipcRenderer.on('new-response', (_, response) => this.addNewResponse(response));
             ipcRenderer.on('update-response', (_, response) => this.updateCurrentResponse(response));
             ipcRenderer.on('update-status', (_, status) => this.setStatus(status));
@@ -487,8 +517,8 @@ export class CheatingDaddyApp extends LitElement {
     disconnectedCallback() {
         super.disconnectedCallback();
         this._stopTimer();
-        if (window.require) {
-            const { ipcRenderer } = window.require('electron');
+        if (window.wehelp) {
+            ipcRenderer.removeAllListeners('response-stream');
             ipcRenderer.removeAllListeners('new-response');
             ipcRenderer.removeAllListeners('update-response');
             ipcRenderer.removeAllListeners('update-status');
@@ -530,13 +560,17 @@ export class CheatingDaddyApp extends LitElement {
 
     setStatus(text) {
         this.statusText = text;
-        if (text.includes('Ready') || text.includes('Listening') || text.includes('Error')) {
+        if (text.includes('Ready') || text.includes('Listening') || /error|cancelled/i.test(text)) {
             this._currentResponseIsComplete = true;
         }
     }
 
     addNewResponse(response) {
         const wasOnLatest = this.currentResponseIndex === this.responses.length - 1;
+        if (this.responses.length >= 200) {
+            this.responses = this.responses.slice(-199);
+            this.currentResponseIndex = Math.max(-1, this.currentResponseIndex - 1);
+        }
         this.responses = [...this.responses, response];
         if (wasOnLatest || this.currentResponseIndex === -1) {
             this.currentResponseIndex = this.responses.length - 1;
@@ -563,32 +597,28 @@ export class CheatingDaddyApp extends LitElement {
 
     async handleClose() {
         if (this.currentView === 'assistant') {
-            cheatingDaddy.stopCapture();
-            if (window.require) {
-                const { ipcRenderer } = window.require('electron');
+            await cheatingDaddy.stopCapture();
+            if (window.wehelp) {
                 await ipcRenderer.invoke('close-session');
             }
             this.sessionActive = false;
             this._stopTimer();
             this.currentView = 'main';
         } else {
-            if (window.require) {
-                const { ipcRenderer } = window.require('electron');
+            if (window.wehelp) {
                 await ipcRenderer.invoke('quit-application');
             }
         }
     }
 
     async _handleMinimize() {
-        if (window.require) {
-            const { ipcRenderer } = window.require('electron');
+        if (window.wehelp) {
             await ipcRenderer.invoke('window-minimize');
         }
     }
 
     async handleHideToggle() {
-        if (window.require) {
-            const { ipcRenderer } = window.require('electron');
+        if (window.wehelp) {
             await ipcRenderer.invoke('toggle-window-visibility');
         }
     }
@@ -596,56 +626,65 @@ export class CheatingDaddyApp extends LitElement {
     // ── Session start ──
 
     async handleStart() {
-        const prefs = await cheatingDaddy.storage.getPreferences();
-        const providerMode = prefs.providerMode === 'cloud' ? 'byok' : prefs.providerMode || 'byok';
+        if (this._startingSession) return;
+        this._startingSession = true;
+        try {
+            const prefs = await cheatingDaddy.storage.getPreferences();
+            const providerMode = prefs.providerMode === 'cloud' ? 'byok' : prefs.providerMode || 'byok';
 
-        if (providerMode === 'cloud') {
-            const creds = await cheatingDaddy.storage.getCredentials();
-            if (!creds.cloudToken || creds.cloudToken.trim() === '') {
-                const mainView = this.shadowRoot.querySelector('main-view');
-                if (mainView && mainView.triggerApiKeyError) {
-                    mainView.triggerApiKeyError();
+            if (providerMode === 'cloud') {
+                const creds = await cheatingDaddy.storage.getCredentials();
+                if (!creds.cloudToken || creds.cloudToken.trim() === '') {
+                    const mainView = this.shadowRoot.querySelector('main-view');
+                    if (mainView && mainView.triggerApiKeyError) {
+                        mainView.triggerApiKeyError();
+                    }
+                    return;
                 }
-                return;
+
+                const success = await cheatingDaddy.initializeCloud(this.selectedProfile);
+                if (!success) {
+                    const mainView = this.shadowRoot.querySelector('main-view');
+                    if (mainView && mainView.triggerApiKeyError) {
+                        mainView.triggerApiKeyError();
+                    }
+                    return;
+                }
+            } else if (providerMode === 'local') {
+                const success = await cheatingDaddy.initializeLocal(this.selectedProfile);
+                if (!success) {
+                    const mainView = this.shadowRoot.querySelector('main-view');
+                    if (mainView && mainView.triggerApiKeyError) {
+                        mainView.triggerApiKeyError();
+                    }
+                    return;
+                }
+            } else {
+                const apiKey = await cheatingDaddy.storage.getApiKey();
+                const runtime = await cheatingDaddy.storage.getConfig();
+                if ((!apiKey || apiKey === '') && runtime.transcriptionProvider !== 'groq' && prefs.audioMode !== 'text_only') {
+                    const mainView = this.shadowRoot.querySelector('main-view');
+                    if (mainView && mainView.triggerApiKeyError) {
+                        mainView.triggerApiKeyError();
+                    }
+                    return;
+                }
+
+                if (!(await cheatingDaddy.initializeGemini(this.selectedProfile, this.selectedLanguage))) return;
             }
 
-            const success = await cheatingDaddy.initializeCloud(this.selectedProfile);
-            if (!success) {
-                const mainView = this.shadowRoot.querySelector('main-view');
-                if (mainView && mainView.triggerApiKeyError) {
-                    mainView.triggerApiKeyError();
-                }
-                return;
-            }
-        } else if (providerMode === 'local') {
-            const success = await cheatingDaddy.initializeLocal(this.selectedProfile);
-            if (!success) {
-                const mainView = this.shadowRoot.querySelector('main-view');
-                if (mainView && mainView.triggerApiKeyError) {
-                    mainView.triggerApiKeyError();
-                }
-                return;
-            }
-        } else {
-            const apiKey = await cheatingDaddy.storage.getApiKey();
-            if (!apiKey || apiKey === '') {
-                const mainView = this.shadowRoot.querySelector('main-view');
-                if (mainView && mainView.triggerApiKeyError) {
-                    mainView.triggerApiKeyError();
-                }
-                return;
-            }
-
-            await cheatingDaddy.initializeGemini(this.selectedProfile, this.selectedLanguage);
+            if (!(await cheatingDaddy.startCapture(this.selectedScreenshotInterval, this.selectedImageQuality))) return;
+            this.responses = [];
+            this.currentResponseIndex = -1;
+            this.startTime = Date.now();
+            this.sessionActive = true;
+            this.currentView = 'assistant';
+            this._startTimer();
+        } catch (error) {
+            this.setStatus('Error: ' + error.message);
+        } finally {
+            this._startingSession = false;
         }
-
-        cheatingDaddy.startCapture(this.selectedScreenshotInterval, this.selectedImageQuality);
-        this.responses = [];
-        this.currentResponseIndex = -1;
-        this.startTime = Date.now();
-        this.sessionActive = true;
-        this.currentView = 'assistant';
-        this._startTimer();
     }
 
     async handleCancelLocalDownload() {
@@ -653,15 +692,13 @@ export class CheatingDaddyApp extends LitElement {
     }
 
     async handleAPIKeyHelp() {
-        if (window.require) {
-            const { ipcRenderer } = window.require('electron');
+        if (window.wehelp) {
             await ipcRenderer.invoke('open-external', 'https://cheatingdaddy.com/help/api-key');
         }
     }
 
     async handleGroqAPIKeyHelp() {
-        if (window.require) {
-            const { ipcRenderer } = window.require('electron');
+        if (window.wehelp) {
             await ipcRenderer.invoke('open-external', 'https://console.groq.com/keys');
         }
     }
@@ -695,8 +732,7 @@ export class CheatingDaddyApp extends LitElement {
     }
 
     async handleExternalLinkClick(url) {
-        if (window.require) {
-            const { ipcRenderer } = window.require('electron');
+        if (window.wehelp) {
             await ipcRenderer.invoke('open-external', url);
         }
     }
@@ -724,8 +760,7 @@ export class CheatingDaddyApp extends LitElement {
     updated(changedProperties) {
         super.updated(changedProperties);
 
-        if (changedProperties.has('currentView') && window.require) {
-            const { ipcRenderer } = window.require('electron');
+        if (changedProperties.has('currentView') && window.wehelp) {
             ipcRenderer.send('view-changed', this.currentView);
         }
     }
@@ -890,7 +925,7 @@ export class CheatingDaddyApp extends LitElement {
         return html`
             <div class="sidebar ${this._isLiveMode() ? 'hidden' : ''}">
                 <div class="sidebar-brand">
-                    <h1>Cheating Daddy</h1>
+                    <h1>WeHelp</h1>
                 </div>
                 <nav class="sidebar-nav">
                     ${items.map(

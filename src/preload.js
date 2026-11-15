@@ -1,2 +1,95 @@
-// See the Electron documentation for details on how to use preload scripts:
-// https://www.electronjs.org/docs/latest/tutorial/process-model#preload-scripts
+const { contextBridge, ipcRenderer } = require('electron');
+const operations = {};
+// Explicit operation allowlist: no arbitrary-channel IPC bridge.
+for (const channel of [
+    'pause-audio',
+    'capture:state',
+    'audio:chunk',
+    'cancel-local-initialization',
+    'cancel-request',
+    'close-session',
+    'get-api-key-status',
+    'get-app-version',
+    'get-current-session',
+    'initialize-cloud',
+    'initialize-gemini',
+    'initialize-local',
+    'local:hardware',
+    'models:list',
+    'models:refresh',
+    'open-external',
+    'performance:audio',
+    'performance:export',
+    'performance:rendered',
+    'performance:snapshot',
+    'quit-application',
+    'send-audio-content',
+    'send-image-content',
+    'send-mic-audio-content',
+    'send-text-message',
+    'start-macos-audio',
+    'start-new-session',
+    'stop-macos-audio',
+    'storage:clear-all',
+    'storage:delete-all-sessions',
+    'storage:delete-session',
+    'storage:get-all-sessions',
+    'storage:get-api-key',
+    'storage:get-config',
+    'storage:get-credentials',
+    'storage:get-groq-api-key',
+    'storage:get-keybinds',
+    'storage:get-preferences',
+    'storage:get-session',
+    'storage:get-today-limits',
+    'storage:save-session',
+    'storage:set-api-key',
+    'storage:set-config',
+    'storage:set-credentials',
+    'storage:set-groq-api-key',
+    'storage:set-keybinds',
+    'storage:set-preferences',
+    'storage:update-config',
+    'storage:update-preference',
+    'toggle-window-visibility',
+    'update-google-search-setting',
+    'verify-api-key',
+    'window-minimize',
+]) {
+    operations[channel] = (...args) => ipcRenderer.invoke(channel, ...args);
+}
+const subscriptions = {};
+for (const channel of [
+    'api-key-problem',
+    'capture-state',
+    'capture-stopped',
+    'clear-sensitive-data',
+    'click-through-toggled',
+    'local-ai-download-progress',
+    'navigate-next-response',
+    'navigate-previous-response',
+    'new-response',
+    'reconnect-failed',
+    'voice-audio',
+    'voice-interrupted',
+    'response-stream',
+    'save-conversation-turn',
+    'save-screen-analysis',
+    'save-session-context',
+    'scroll-response-down',
+    'scroll-response-up',
+    'session-initializing',
+    'shortcut',
+    'update-response',
+    'update-status',
+    'whisper-downloading',
+]) {
+    subscriptions[channel] = callback => {
+        const handler = (_event, data) => callback(data);
+        ipcRenderer.on(channel, handler);
+        return () => ipcRenderer.removeListener(channel, handler);
+    };
+}
+const commands = {};
+for (const channel of ['update-keybinds', 'view-changed']) commands[channel] = (...args) => ipcRenderer.send(channel, ...args);
+contextBridge.exposeInMainWorld('wehelp', { operations, subscriptions, commands, platform: process.platform });

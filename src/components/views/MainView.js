@@ -1,3 +1,4 @@
+import './EngineSettings.js';
 import { html, css, LitElement } from '../../assets/lit-core-2.7.4.min.js';
 
 const LOCAL_LLM_PRESETS = [
@@ -764,8 +765,10 @@ export class MainView extends LitElement {
 
             // Load keys
             this._token = creds.cloudToken || '';
-            this._geminiKey = (await cheatingDaddy.storage.getApiKey().catch(() => '')) || '';
-            this._groqKey = (await cheatingDaddy.storage.getGroqApiKey().catch(() => '')) || '';
+            this._hasGeminiKey = !!(await cheatingDaddy.storage.getApiKey().catch(() => ''));
+            this._geminiKey = '';
+            this._hasGroqKey = !!(await cheatingDaddy.storage.getGroqApiKey().catch(() => ''));
+            this._groqKey = '';
             this._openaiKey = creds.openaiKey || '';
             this._geminiLiveModel = config.geminiLiveModel || 'gemini-3.1-flash-live-preview';
             this._groqModel = config.groqModel || 'qwen/qwen3.6-27b';
@@ -934,14 +937,30 @@ export class MainView extends LitElement {
 
     async _saveGeminiKey(val) {
         this._geminiKey = val;
+        this._hasGeminiKey = !!val;
         this._keyError = false;
-        await cheatingDaddy.storage.setApiKey(val);
+        try {
+            await cheatingDaddy.storage.setApiKey(val);
+            this._geminiKey = '';
+            this._credentialError = '';
+        } catch (error) {
+            this._credentialError = error.message;
+            this._hasGeminiKey = false;
+        }
         this.requestUpdate();
     }
 
     async _saveGroqKey(val) {
         this._groqKey = val;
-        await cheatingDaddy.storage.setGroqApiKey(val);
+        this._hasGroqKey = !!val;
+        try {
+            await cheatingDaddy.storage.setGroqApiKey(val);
+            this._groqKey = '';
+            this._credentialError = '';
+        } catch (error) {
+            this._credentialError = error.message;
+            this._hasGroqKey = false;
+        }
         this.requestUpdate();
     }
 
@@ -1019,11 +1038,16 @@ export class MainView extends LitElement {
 
     // ── Start ──
 
-    _handleStart() {
+    async _handleStart() {
         if (this.isInitializing || this.downloadProgress.active) return;
 
         if (this._mode === 'byok') {
-            if (!this._geminiKey.trim()) {
+            if (
+                !this._geminiKey.trim() &&
+                !this._hasGeminiKey &&
+                this.shadowRoot.querySelector('engine-settings')?.config.transcriptionProvider !== 'groq' &&
+                (await cheatingDaddy.storage.getPreferences()).audioMode !== 'text_only'
+            ) {
                 this._keyError = true;
                 this.requestUpdate();
                 return;
@@ -1157,7 +1181,14 @@ export class MainView extends LitElement {
     }
 
     _renderByokMode() {
-        return html`
+        return html`${this._credentialError ? html`<p role="alert">${this._credentialError}</p>` : ''}<engine-settings
+                @local-profile-changed=${event => {
+                    this._localLlmModel = event.detail;
+                }}
+                @engine-mode-changed=${event => {
+                    this._mode = event.detail;
+                }}
+            ></engine-settings>
             <details class="config-section">
                 <summary class="config-summary">
                     <span class="config-summary-text">
@@ -1171,19 +1202,15 @@ export class MainView extends LitElement {
                         <label class="form-label">Gemini API Key</label>
                         <input
                             type="password"
-                            placeholder="Required"
+                            placeholder=${this._hasGeminiKey ? 'Saved securely — enter to replace' : 'Required for Gemini'}
                             .value=${this._geminiKey}
-                            @input=${e => this._saveGeminiKey(e.target.value)}
+                            @change=${e => this._saveGeminiKey(e.target.value)}
                             class=${this._keyError ? 'error' : ''}
                         />
                         <div class="form-hint">
                             <span class="link" @click=${() => this.onExternalLink('https://aistudio.google.com/apikey')}>Get Gemini key</span>
+                            <button @click=${() => this._saveGeminiKey('')}>Clear saved Gemini key</button>
                         </div>
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Gemini Live Model</label>
-                        <input type="text" .value=${this._geminiLiveModel} @input=${e => this._saveGeminiLiveModel(e.target.value)} />
                     </div>
                 </div>
             </details>
@@ -1199,20 +1226,16 @@ export class MainView extends LitElement {
                 <div class="config-content">
                     <div class="form-group">
                         <label class="form-label">Groq API Key</label>
-                        <input type="password" placeholder="Optional" .value=${this._groqKey} @input=${e => this._saveGroqKey(e.target.value)} />
+                        <input
+                            type="password"
+                            placeholder=${this._hasGroqKey ? 'Saved securely — enter to replace' : 'Optional'}
+                            .value=${this._groqKey}
+                            @change=${e => this._saveGroqKey(e.target.value)}
+                        />
                         <div class="form-hint">
                             <span class="link" @click=${() => this.onExternalLink('https://console.groq.com/keys')}>Get Groq key</span>
+                            <button @click=${() => this._saveGroqKey('')}>Clear saved Groq key</button>
                         </div>
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Groq Model</label>
-                        <input type="text" .value=${this._groqModel} @input=${e => this._saveGroqModel(e.target.value)} />
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Groq Image Model</label>
-                        <input type="text" .value=${this._groqImageModel} @input=${e => this._saveGroqImageModel(e.target.value)} />
                     </div>
 
                     <label class="config-checkbox">
@@ -1239,14 +1262,20 @@ export class MainView extends LitElement {
 
             <div class="mode-links">
                 <button class="mode-link" @click=${() => this._saveMode('local')}>Use local AI</button>
-            </div>
-        `;
+            </div> `;
     }
 
     // ── Local AI mode ──
 
     _renderLocalMode() {
-        return html`
+        return html`<engine-settings
+                @local-profile-changed=${event => {
+                    this._localLlmModel = event.detail;
+                }}
+                @engine-mode-changed=${event => {
+                    this._mode = event.detail;
+                }}
+            ></engine-settings>
             <details class="config-section">
                 <summary class="config-summary">
                     <span class="config-summary-text">
@@ -1312,8 +1341,7 @@ export class MainView extends LitElement {
 
             <div class="mode-links">
                 <button class="mode-link" @click=${() => this._saveMode('byok')}>Use own API keys</button>
-            </div>
-        `;
+            </div> `;
     }
 
     // ── Main render ──
@@ -1335,11 +1363,11 @@ export class MainView extends LitElement {
                     this._mode === 'local'
                         ? html`
                               <div class="title-row">
-                                  <div class="page-title">Cheating Daddy <span class="mode-suffix">Local AI</span></div>
+                                  <div class="page-title">WeHelp <span class="mode-suffix">Local AI</span></div>
                                   <button class="help-btn" @click=${this._openLocalHelp} aria-label="Open Local AI help">${helpIcon}</button>
                               </div>
                           `
-                        : html` <div class="page-title">${html`Cheating Daddy <span class="mode-suffix">BYOK</span>`}</div> `
+                        : html` <div class="page-title">${html`WeHelp <span class="mode-suffix">BYOK</span>`}</div> `
                 }
                 <div class="page-subtitle">${this._mode === 'byok' ? 'Bring your own API keys' : 'Run models locally on your machine'}</div>
 
@@ -1363,8 +1391,8 @@ export class MainView extends LitElement {
                         <div class="help-section">
                             <div class="help-section-title">Native local AI</div>
                             <div class="help-section-text">
-                                Cheating Daddy runs llama.cpp and whisper.cpp directly. Everything stays on your computer — no external AI service or
-                                Ollama installation is required.
+                                WeHelp runs llama.cpp and whisper.cpp directly. Everything stays on your computer — no external AI service or Ollama
+                                installation is required.
                             </div>
                         </div>
 
@@ -1372,7 +1400,7 @@ export class MainView extends LitElement {
                             <div class="help-section-title">Automatic setup</div>
                             <div class="help-section-text">
                                 The correct native runners, selected Whisper model, and language model are downloaded and checksum-verified on first
-                                use. They are stored in the Cheating Daddy config directory.
+                                use. They are stored in the WeHelp config directory.
                             </div>
                         </div>
 

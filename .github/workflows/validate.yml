@@ -1,0 +1,44 @@
+name: Validate WeHelp
+on:
+    pull_request:
+    push:
+        branches: [main]
+    workflow_dispatch:
+permissions:
+    contents: read
+jobs:
+    tests:
+        runs-on: ${{ matrix.os }}
+        strategy:
+            matrix:
+                os: [ubuntu-latest, windows-latest]
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: npm
+            - run: npm ci
+            - run: npm test
+            - run: npm run check
+            - run: npm run benchmark
+            - name: Electron UI smoke (Linux)
+              if: runner.os == 'Linux'
+              run: xvfb-run -a npx electron scripts/electron-smoke.cjs --no-sandbox
+              env:
+                  WEHELP_DATA_DIR: ${{ runner.temp }}/wehelp-data
+                  XDG_CONFIG_HOME: ${{ runner.temp }}/wehelp-config
+            - name: Electron UI smoke (Windows)
+              if: runner.os == 'Windows'
+              run: npx electron scripts/electron-smoke.cjs
+              env:
+                  WEHELP_DATA_DIR: ${{ runner.temp }}/wehelp-data
+            - name: Build Windows x64 installer
+              if: runner.os == 'Windows'
+              run: npm run make -- --platform=win32 --arch=x64
+            - uses: actions/upload-artifact@v4
+              if: runner.os == 'Windows'
+              with:
+                  name: WeHelp-Windows-x64
+                  path: out/make/squirrel.windows/x64/*
+                  if-no-files-found: error

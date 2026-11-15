@@ -1,5 +1,14 @@
 const fs = require('fs');
 const path = require('path');
+const { Endpoint } = require('../audio/endpoint');
+const { PROFILES } = require('../engine/model-router');
+const { prepareContext } = require('../engine/context-manager');
+const { readSSE } = require('../engine/network');
+const { monitor } = require('../engine/performance-monitor');
+const { generation } = require('./gemini');
+const localEndpoints = new Map();
+let localEpoch = 0;
+let transcriptionController = null;
 const { getSystemPrompt } = require('./prompts');
 const { sendToRenderer, initializeNewSession, saveConversationTurn } = require('./gemini');
 const {
@@ -130,7 +139,7 @@ function createWavBuffer(pcm16Buffer) {
     return Buffer.concat([header, pcm16Buffer]);
 }
 
-async function transcribeAudio(pcm16kBuffer) {
+async function transcribeAudio(pcm16kBuffer, signal) {
     if (!whisperBaseUrl) {
         throw new Error('Whisper server is not running');
     }
@@ -145,6 +154,7 @@ async function transcribeAudio(pcm16kBuffer) {
     const response = await fetch(`${whisperBaseUrl}/inference`, {
         method: 'POST',
         body: formData,
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30000)]) : AbortSignal.timeout(30000),
     });
 
     if (!response.ok) {
@@ -153,12 +163,15 @@ async function transcribeAudio(pcm16kBuffer) {
 
     const result = await response.json();
     const text = result.text?.trim() || '';
-    console.log('[LocalAI] Transcription:', text);
+
     return text;
 }
 
 async function handleSpeechEnd(audioData) {
     if (!isLocalActive) return;
+    const epoch = localEpoch;
+    transcriptionController?.abort();
+    const controller = (transcriptionController = new AbortController());
 
     if (audioData.length < 16000) {
         console.log('[LocalAI] Audio too short, skipping');
@@ -167,7 +180,8 @@ async function handleSpeechEnd(audioData) {
     }
 
     try {
-        const transcription = await transcribeAudio(audioData);
+        const transcription = await transcribeAudio(audioData, controller.signal);
+        if (epoch !== localEpoch || !isLocalActive) return;
 
         if (!transcription || transcription.length < 2) {
             console.log('[LocalAI] Empty transcription, skipping');
@@ -178,100 +192,81 @@ async function handleSpeechEnd(audioData) {
         sendToRenderer('update-status', 'Generating response...');
         await sendToLlama(transcription);
     } catch (error) {
+        if (controller.signal.aborted || epoch !== localEpoch) return;
         console.error('[LocalAI] Transcription error:', error);
         sendToRenderer('update-status', 'Transcription error: ' + error.message);
     }
 }
 
-async function readStreamingResponse(response, onText) {
-    const decoder = new TextDecoder();
-    let pendingText = '';
-    let fullText = '';
-
-    for await (const chunk of response.body) {
-        pendingText += decoder.decode(chunk, { stream: true });
-        const lines = pendingText.split('\n');
-        pendingText = lines.pop() || '';
-
-        for (const line of lines) {
-            if (!line.startsWith('data: ')) continue;
-
-            const data = line.slice(6).trim();
-            if (!data || data === '[DONE]') continue;
-
-            const event = JSON.parse(data);
+async function requestLlama(messages) {
+    if (!llamaBaseUrl) throw new Error('Llama server is not running');
+    const request = generation.requests.begin('local', llamaModel || 'local', 'text');
+    const id = request.requestId;
+    const emit = (type, data = {}) =>
+        sendToRenderer('response-stream', { requestId: id, sessionId: request.sessionId, sequence: request.sequence++, type, ...data });
+    const deadline = setTimeout(() => request.controller.abort(new DOMException('Local inference timed out', 'TimeoutError')), 120000);
+    try {
+        emit('start', { provider: 'local', model: llamaModel });
+        const response = await fetch(`${llamaBaseUrl}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: request.controller.signal,
+            body: JSON.stringify({
+                model: 'local',
+                messages,
+                stream: true,
+                max_tokens: (PROFILES[require('../storage').getConfig().performanceMode] || PROFILES.offline).outputTokens,
+                chat_template_kwargs: { enable_thinking: false },
+            }),
+        });
+        monitor.mark(id, 'headers');
+        if (!response.ok) throw new Error(`Local server returned HTTP ${response.status}`);
+        let fullText = '',
+            finished = false;
+        for await (const event of readSSE(response, { signal: request.controller.signal, firstTokenMs: 60000, idleMs: 30000 })) {
+            if (!generation.requests.current(request)) throw new DOMException('Cancelled', 'AbortError');
             const token = event.choices?.[0]?.delta?.content || '';
-            if (!token) continue;
-
-            fullText += token;
-            onText(fullText);
+            if (event.choices?.[0]?.finish_reason) finished = true;
+            if (token) {
+                monitor.mark(id, 'firstToken');
+                request.chars += token.length;
+                fullText += token;
+                emit('delta', { delta: token });
+            }
+            if (fullText.length > 1000000) throw new Error('Local response exceeds size limit');
         }
+        if (!finished) throw new Error('Local inference stream disconnected');
+        emit('complete');
+        generation.requests.finish(request, 'COMPLETED');
+        return fullText;
+    } catch (error) {
+        if (generation.requests.current(request)) emit('error', { message: error.message });
+        generation.requests.finish(request, request.controller.signal.aborted ? 'CANCELLED' : 'FAILED');
+        throw error;
+    } finally {
+        clearTimeout(deadline);
     }
-
-    return fullText;
-}
-
-async function requestLlama(messages, onText) {
-    if (!llamaBaseUrl) {
-        throw new Error('Llama server is not running');
-    }
-
-    const response = await fetch(`${llamaBaseUrl}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            model: 'local',
-            messages,
-            stream: true,
-            max_tokens: 2048,
-            chat_template_kwargs: {
-                enable_thinking: false,
-            },
-        }),
-    });
-
-    if (!response.ok || !response.body) {
-        const errorText = await response.text();
-        throw new Error(`Llama server returned HTTP ${response.status}: ${errorText}`);
-    }
-
-    return readStreamingResponse(response, onText);
 }
 
 async function sendToLlama(transcription) {
-    localConversationHistory.push({
-        role: 'user',
-        content: transcription.trim(),
+    const epoch = localEpoch;
+    const history = localConversationHistory.slice();
+    const messages = prepareContext(currentSystemPrompt, history, transcription.trim(), {
+        budget: 8000,
+        outputTokens: (PROFILES[require('../storage').getConfig().performanceMode] || PROFILES.offline).outputTokens,
+        style: require('../storage').getConfig().responseStyle,
     });
-
-    if (localConversationHistory.length > 20) {
-        localConversationHistory = localConversationHistory.slice(-20);
+    const fullText = await requestLlama(messages);
+    if (epoch !== localEpoch || !isLocalActive) return;
+    if (fullText.trim()) {
+        localConversationHistory = [
+            ...history,
+            { role: 'user', content: transcription.trim() },
+            { role: 'assistant', content: fullText.trim() },
+        ].slice(-100);
+        saveConversationTurn(transcription, fullText);
     }
-
-    try {
-        const messages = [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...localConversationHistory];
-
-        let isFirst = true;
-        const fullText = await requestLlama(messages, text => {
-            sendToRenderer(isFirst ? 'new-response' : 'update-response', text);
-            isFirst = false;
-        });
-
-        if (fullText.trim()) {
-            localConversationHistory.push({
-                role: 'assistant',
-                content: fullText.trim(),
-            });
-            saveConversationTurn(transcription, fullText);
-        }
-
-        console.log('[LocalAI] Llama response completed');
-        sendToRenderer('update-status', 'Listening...');
-    } catch (error) {
-        console.error('[LocalAI] Llama error:', error);
-        sendToRenderer('update-status', 'Local AI error: ' + error.message);
-        throw error;
-    }
+    sendToRenderer('update-status', 'Listening...');
 }
 
 function formatDownloadStatus(label, progress) {
@@ -325,28 +320,29 @@ function removeNewLlamaCacheEntries() {
 }
 
 async function prepareNativeFiles(llamaModelReference, whisperModel, signal) {
+    const offline = require('../storage').getConfig().performanceMode === 'offline';
     const binaryProgress = label => progress => {
         sendToRenderer('update-status', formatDownloadStatus(label, progress));
         sendDownloadProgress(label, progress);
     };
 
     sendDownloadProgress('Checking Llama runner');
-    const llamaBinaryPath = await ensureNativeBinary('llama', binaryProgress('Llama runner'), signal);
+    const llamaBinaryPath = await ensureNativeBinary('llama', binaryProgress('Llama runner'), signal, offline);
 
     sendDownloadProgress('Checking Whisper runner');
-    const whisperBinaryPath = await ensureNativeBinary('whisper', binaryProgress('Whisper runner'), signal);
+    const whisperBinaryPath = await ensureNativeBinary('whisper', binaryProgress('Whisper runner'), signal, offline);
 
     let whisperModelPath;
     sendToRenderer('whisper-downloading', true);
     try {
         sendDownloadProgress('Checking Whisper model');
-        whisperModelPath = await ensureWhisperModel(whisperModel, binaryProgress('Whisper model'), signal);
+        whisperModelPath = await ensureWhisperModel(whisperModel, binaryProgress('Whisper model'), signal, offline);
     } finally {
         sendToRenderer('whisper-downloading', false);
     }
 
     sendDownloadProgress('Checking language model');
-    const llamaFiles = await ensureLlamaModel(llamaModelReference, binaryProgress('Language model'), binaryProgress('Vision model'), signal);
+    const llamaFiles = await ensureLlamaModel(llamaModelReference, binaryProgress('Language model'), binaryProgress('Vision model'), signal, offline);
     return {
         llamaBinaryPath,
         whisperBinaryPath,
@@ -377,7 +373,16 @@ async function startWhisperServer(executablePath, modelPath) {
     whisperBaseUrl = `http://127.0.0.1:${port}`;
     whisperProcess = startNativeServer({
         executablePath,
-        arguments: ['-m', modelPath, '--host', '127.0.0.1', '--port', String(port)],
+        arguments: [
+            '-m',
+            modelPath,
+            '--host',
+            '127.0.0.1',
+            '--port',
+            String(port),
+            '-t',
+            String(Math.max(1, Math.min(8, require('node:os').availableParallelism() - 1))),
+        ],
         name: 'Whisper',
     });
 
@@ -402,6 +407,8 @@ async function startLlamaServer(executablePath, modelPath, projectorPath) {
         'local',
         '-c',
         '8192',
+        '-t',
+        String(Math.max(1, Math.min(8, require('node:os').availableParallelism() - 1))),
         '-m',
         modelPath,
         '--mmproj',
@@ -428,12 +435,14 @@ async function initializeLocalSession(model, whisperModel, profile, customPrompt
 
     try {
         closeLocalSession();
-        initializationController = new AbortController();
+        const controller = (initializationController = new AbortController());
+        const epoch = localEpoch;
         llamaCacheSnapshot = getDirectoryEntries(path.join(getModelsDirectory(), 'llama'));
         currentSystemPrompt = getSystemPrompt(profile, customPrompt, false);
         llamaModel = model;
 
         const nativeFiles = await prepareNativeFiles(model, whisperModel, initializationController.signal);
+        if (controller.signal.aborted || epoch !== localEpoch) throw new DOMException('Cancelled', 'AbortError');
         validatePreparedNativeFiles(nativeFiles);
 
         sendToRenderer('update-status', 'Starting Whisper...');
@@ -444,6 +453,7 @@ async function initializeLocalSession(model, whisperModel, profile, customPrompt
         sendDownloadProgress('Loading language model');
         await startLlamaServer(nativeFiles.llamaBinaryPath, nativeFiles.llamaModelPath, nativeFiles.projectorPath);
 
+        if (controller.signal.aborted || epoch !== localEpoch) throw new DOMException('Cancelled', 'AbortError');
         isSpeaking = false;
         speechBuffers = [];
         silenceFrameCount = 0;
@@ -477,16 +487,25 @@ async function initializeLocalSession(model, whisperModel, profile, customPrompt
     }
 }
 
-function processLocalAudio(monoChunk24k) {
+function processLocalAudio(pcm, source = 'system') {
     if (!isLocalActive) return;
-
-    const pcm16k = resample24kTo16k(monoChunk24k);
-    if (pcm16k.length > 0) {
-        processVad(pcm16k);
+    let endpoint = localEndpoints.get(source);
+    if (!endpoint) {
+        endpoint = new Endpoint({
+            silenceMs: require('../storage').getConfig().endpointSilenceMs || 700,
+            onEnd: audio => handleSpeechEnd(resample24kTo16k(audio)),
+        });
+        localEndpoints.set(source, endpoint);
     }
+    endpoint.push(pcm);
 }
 
 function closeLocalSession() {
+    localEpoch++;
+    transcriptionController?.abort();
+    transcriptionController = null;
+    generation.requests.cancel();
+    localEndpoints.clear();
     isLocalActive = false;
     initializationController?.abort();
     initializationController = null;
@@ -556,27 +575,21 @@ async function sendLocalImage(base64Data, prompt) {
         ],
     };
 
-    localConversationHistory.push({ role: 'user', content: prompt });
-    if (localConversationHistory.length > 20) {
-        localConversationHistory = localConversationHistory.slice(-20);
-    }
-
     try {
         sendToRenderer('update-status', 'Analyzing image...');
-        const messages = [
-            { role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' },
-            ...localConversationHistory.slice(0, -1),
-            userMessage,
-        ];
-
-        let isFirst = true;
-        const fullText = await requestLlama(messages, text => {
-            sendToRenderer(isFirst ? 'new-response' : 'update-response', text);
-            isFirst = false;
+        const history = localConversationHistory.slice();
+        const messages = prepareContext(currentSystemPrompt, history, userMessage.content, {
+            budget: 8000,
+            outputTokens: 1024,
+            style: require('../storage').getConfig().responseStyle,
         });
 
+        const epoch = localEpoch;
+        const fullText = await requestLlama(messages);
+        if (epoch !== localEpoch || !isLocalActive) return { success: false, cancelled: true };
+
         if (fullText.trim()) {
-            localConversationHistory.push({ role: 'assistant', content: fullText.trim() });
+            localConversationHistory = [...history, { role: 'user', content: prompt }, { role: 'assistant', content: fullText.trim() }].slice(-100);
             saveConversationTurn(prompt, fullText);
         }
 
@@ -594,6 +607,7 @@ module.exports = {
     cancelLocalInitialization,
     processLocalAudio,
     closeLocalSession,
+    cancelGeneration: () => generation.requests.cancel(),
     isLocalSessionActive,
     sendLocalText,
     sendLocalImage,

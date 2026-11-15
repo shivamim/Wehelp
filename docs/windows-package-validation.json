@@ -1,0 +1,11 @@
+{
+  "crossPackaged": true,
+  "executable": true,
+  "main": true,
+  "preload": true,
+  "gplResource": true,
+  "unwanted": [],
+  "inventoryFiles": 1071,
+  "windowsRuntimeTested": false,
+  "installerTested": false
+}
