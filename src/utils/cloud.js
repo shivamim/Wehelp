@@ -23,7 +23,9 @@ function setOnTurnComplete(callback) {
 function connectCloud(token, profile, userContext) {
     // Close existing connection
     if (cloudWs) {
-        try { cloudWs.close(); } catch (e) {}
+        try {
+            cloudWs.close();
+        } catch (e) {}
         cloudWs = null;
         isCloudConnected = false;
     }
@@ -32,7 +34,7 @@ function connectCloud(token, profile, userContext) {
 
     return new Promise((resolve, reject) => {
         const url = `wss://api.cheatingdaddy.com/ws?token=${encodeURIComponent(token)}`;
-        console.log('[Cloud] Connecting to', url);
+        console.log('[Cloud] Connecting');
 
         cloudWs = new WebSocket(url);
 
@@ -52,7 +54,7 @@ function connectCloud(token, profile, userContext) {
             const config = JSON.stringify({
                 type: 'set_config',
                 profile: profile || 'interview',
-                user_context: userContext || ''
+                user_context: userContext || '',
             });
             cloudWs.send(config);
             console.log('[Cloud] Config sent:', profile);
@@ -61,7 +63,7 @@ function connectCloud(token, profile, userContext) {
             resolve(true);
         });
 
-        cloudWs.on('message', (data) => {
+        cloudWs.on('message', data => {
             try {
                 const msg = JSON.parse(data.toString());
                 handleMessage(msg);
@@ -77,7 +79,7 @@ function connectCloud(token, profile, userContext) {
             clearTimeout(timeout);
         });
 
-        cloudWs.on('error', (err) => {
+        cloudWs.on('error', err => {
             console.error('[Cloud] WebSocket error:', err.message);
             isCloudConnected = false;
             clearTimeout(timeout);
@@ -93,7 +95,6 @@ function handleMessage(msg) {
             break;
 
         case 'transcription':
-            console.log('[Cloud] Transcription:', msg.text);
             currentTranscription = msg.text || '';
             sendToRenderer('update-status', 'Generating response...');
             break;
@@ -137,7 +138,7 @@ function sendCloudAudio(pcmBuffer) {
         return;
     }
 
-    cloudWs.send(pcmBuffer, { binary: true }, (err) => {
+    cloudWs.send(pcmBuffer, { binary: true }, err => {
         if (err) {
             console.error('[Cloud] Audio send error:', err.message);
         }
@@ -149,10 +150,12 @@ function sendCloudAudio(pcmBuffer) {
 
 function sendCloudText(text) {
     if (cloudWs && isCloudConnected && cloudWs.readyState === WebSocket.OPEN) {
-        cloudWs.send(JSON.stringify({
-            type: 'test_text',
-            text: text
-        }));
+        cloudWs.send(
+            JSON.stringify({
+                type: 'test_text',
+                text: text,
+            })
+        );
     }
 }
 
@@ -160,10 +163,12 @@ function sendCloudImage(base64Data) {
     if (!cloudWs || !isCloudConnected || cloudWs.readyState !== WebSocket.OPEN) {
         return false;
     }
-    cloudWs.send(JSON.stringify({
-        type: 'image',
-        image: base64Data
-    }));
+    cloudWs.send(
+        JSON.stringify({
+            type: 'image',
+            image: base64Data,
+        })
+    );
     return true;
 }
 

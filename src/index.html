@@ -1,8 +1,11 @@
 <!doctype html>
 <html>
     <head>
-        <meta http-equiv="content-security-policy" content="script-src 'self' 'unsafe-inline'" />
-        <title>Screen and Audio Capture</title>
+        <meta
+            http-equiv="content-security-policy"
+            content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-src 'none'"
+        />
+        <title>WeHelp</title>
         <style>
             :root {
                 /* Backgrounds */
@@ -185,13 +188,13 @@
         </style>
     </head>
     <body>
+        <script src="assets/purify.min.js"></script>
         <script src="assets/marked-4.3.0.min.js"></script>
         <script src="assets/highlight-11.9.0.min.js"></script>
         <link rel="stylesheet" href="assets/highlight-vscode-dark.min.css" />
-        <script type="module" src="components/app/CheatingDaddyApp.js"></script>
 
         <cheating-daddy-app id="cheatingDaddy"></cheating-daddy-app>
-        <script src="script.js"></script>
-        <script src="utils/renderer.js"></script>
+        <script type="module" src="utils/renderer.js"></script>
+        <script type="module" src="components/app/CheatingDaddyApp.js"></script>
     </body>
 </html>

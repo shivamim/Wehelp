@@ -1,11 +1,29 @@
+const startupStart = require('node:perf_hooks').performance.now();
 if (require('electron-squirrel-startup')) {
     process.exit(0);
 }
 
-const { app, BrowserWindow, shell, ipcMain } = require('electron');
+const { app, BrowserWindow, shell, ipcMain, Tray, Menu, nativeImage } = require('electron');
 const { createWindow, updateGlobalShortcuts } = require('./utils/window');
 const { setupGeminiIpcHandlers, stopMacOSAudioCapture, sendToRenderer } = require('./utils/gemini');
 const storage = require('./storage');
+const { ApiKeyManager } = require('./utils/apiKeys');
+const { setApiKeyManager, setRuntimeConfigGetter, shutdownSession, generation } = require('./utils/gemini');
+const { monitor } = require('./engine/performance-monitor');
+monitor.boot = startupStart;
+require('./security/ipc-validation').installIpcValidation(ipcMain);
+// Preserve Electron's original user-data directory while rebranding.
+app.setPath('userData', require('node:path').join(app.getPath('appData'), 'cheating-daddy'));
+if (!app.requestSingleInstanceLock()) app.quit();
+app.on('second-instance', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.show();
+        mainWindow.focus();
+    }
+});
+let tray;
+let quitting = false;
+let shutdownComplete = false;
 
 const geminiSessionRef = { current: null };
 let mainWindow = null;
@@ -15,21 +33,64 @@ function createMainWindow() {
     return mainWindow;
 }
 
-app.whenReady().then(async () => {
-    // Initialize storage (checks version, resets if needed)
-    storage.initializeStorage();
+app.whenReady()
+    .then(async () => {
+        // Initialize storage (checks version, resets if needed)
+        storage.initializeStorage();
 
-    // Trigger screen recording permission prompt on macOS if not already granted
-    if (process.platform === 'darwin') {
-        const { desktopCapturer } = require('electron');
-        desktopCapturer.getSources({ types: ['screen'] }).catch(() => {});
-    }
-
-    createMainWindow();
-    setupGeminiIpcHandlers(geminiSessionRef);
-    setupStorageIpcHandlers();
-    setupGeneralIpcHandlers();
-});
+        const keys = new ApiKeyManager(storage.getConfigDir);
+        storage.setApiKeyManager(keys);
+        setApiKeyManager(keys);
+        setRuntimeConfigGetter(storage.getConfig);
+        // Complete credential migration before providers and renderer are reachable.
+        keys.getApiKey();
+        keys.getGroqApiKey();
+        setupGeminiIpcHandlers(geminiSessionRef);
+        setupStorageIpcHandlers();
+        setupGeneralIpcHandlers();
+        monitor.resources();
+        createMainWindow();
+        mainWindow.webContents.once('did-finish-load', () => {
+            monitor.startupMs = monitor.now() - monitor.boot;
+        });
+        tray = new Tray(nativeImage.createFromPath(require('node:path').join(__dirname, 'assets/logo.png')).resize({ width: 16, height: 16 }));
+        tray.setToolTip('WeHelp — idle');
+        tray.setContextMenu(
+            Menu.buildFromTemplate([
+                {
+                    label: 'Show WeHelp',
+                    click: () => {
+                        mainWindow.show();
+                        mainWindow.focus();
+                    },
+                },
+                { label: 'Stop session', click: () => shutdownSession() },
+                { label: 'Quit WeHelp', click: () => app.quit() },
+            ])
+        );
+        tray.on('double-click', () => {
+            mainWindow.show();
+            mainWindow.focus();
+        });
+        mainWindow.on('minimize', event => {
+            if (storage.getConfig().minimizeToTray) {
+                event.preventDefault();
+                mainWindow.hide();
+            }
+        });
+        mainWindow.on('close', event => {
+            if (!quitting && storage.getConfig().minimizeToTray) {
+                event.preventDefault();
+                mainWindow.hide();
+            } else shutdownSession();
+        });
+        if (process.platform !== 'linux') app.setLoginItemSettings({ openAtLogin: storage.getConfig().launchAtLogin === true });
+    })
+    .catch(error => {
+        console.error('Startup failed:', error.message);
+        require('electron').dialog.showErrorBox('WeHelp startup failed', error.message);
+        app.quit();
+    });
 
 app.on('window-all-closed', () => {
     stopMacOSAudioCapture();
@@ -38,9 +99,18 @@ app.on('window-all-closed', () => {
     }
 });
 
-app.on('before-quit', () => {
-    stopMacOSAudioCapture();
-    require('./utils/localai').closeLocalSession();
+app.on('before-quit', event => {
+    quitting = true;
+    if (shutdownComplete) return;
+    event.preventDefault();
+    Promise.all([shutdownSession(), storage.flushStorage()])
+        .catch(error => console.error('Shutdown error:', error.message))
+        .finally(() => {
+            monitor.close();
+            tray?.destroy();
+            shutdownComplete = true;
+            app.quit();
+        });
 });
 
 app.on('activate', () => {
@@ -61,8 +131,9 @@ function setupStorageIpcHandlers() {
     });
 
     ipcMain.handle('storage:set-config', async (event, config) => {
+        if (Object.keys(config).some(key => /Model$|Provider$|performanceMode/.test(key))) await shutdownSession();
         try {
-            storage.setConfig(config);
+            if ((await storage.setConfig(config)) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
             console.error('Error setting config:', error);
@@ -71,8 +142,11 @@ function setupStorageIpcHandlers() {
     });
 
     ipcMain.handle('storage:update-config', async (event, key, value) => {
+        if (/Model$|Provider$|performanceMode/.test(key) && storage.getConfig()[key] !== value) await shutdownSession();
         try {
-            storage.updateConfig(key, value);
+            if (key === 'alwaysOnTop') mainWindow?.setAlwaysOnTop(value);
+            if (key === 'launchAtLogin') app.setLoginItemSettings({ openAtLogin: value });
+            if ((await storage.updateConfig(key, value)) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
             console.error('Error updating config:', error);
@@ -83,7 +157,7 @@ function setupStorageIpcHandlers() {
     // ============ CREDENTIALS ============
     ipcMain.handle('storage:get-credentials', async () => {
         try {
-            return { success: true, data: storage.getCredentials() };
+            return { success: true, data: { configured: true } };
         } catch (error) {
             console.error('Error getting credentials:', error);
             return { success: false, error: error.message };
@@ -92,7 +166,7 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:set-credentials', async (event, credentials) => {
         try {
-            storage.setCredentials(credentials);
+            if ((await storage.setCredentials(credentials)) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
             console.error('Error setting credentials:', error);
@@ -102,7 +176,7 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:get-api-key', async () => {
         try {
-            return { success: true, data: storage.getApiKey() };
+            return { success: true, data: storage.getApiKey() ? 'configured' : '' };
         } catch (error) {
             console.error('Error getting API key:', error);
             return { success: false, error: error.message };
@@ -110,8 +184,10 @@ function setupStorageIpcHandlers() {
     });
 
     ipcMain.handle('storage:set-api-key', async (event, apiKey) => {
+        await shutdownSession();
         try {
-            storage.setApiKey(apiKey);
+            generation.registry.invalidate('gemini');
+            if ((await storage.setApiKey(apiKey)) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
             console.error('Error setting API key:', error);
@@ -121,7 +197,7 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:get-groq-api-key', async () => {
         try {
-            return { success: true, data: storage.getGroqApiKey() };
+            return { success: true, data: storage.getGroqApiKey() ? 'configured' : '' };
         } catch (error) {
             console.error('Error getting Groq API key:', error);
             return { success: false, error: error.message };
@@ -129,8 +205,10 @@ function setupStorageIpcHandlers() {
     });
 
     ipcMain.handle('storage:set-groq-api-key', async (event, groqApiKey) => {
+        await shutdownSession();
         try {
-            storage.setGroqApiKey(groqApiKey);
+            generation.registry.invalidate('groq');
+            if ((await storage.setGroqApiKey(groqApiKey)) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
             console.error('Error setting Groq API key:', error);
@@ -150,7 +228,7 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:set-preferences', async (event, preferences) => {
         try {
-            storage.setPreferences(preferences);
+            if ((await storage.setPreferences(preferences)) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
             console.error('Error setting preferences:', error);
@@ -160,7 +238,7 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:update-preference', async (event, key, value) => {
         try {
-            storage.updatePreference(key, value);
+            if ((await storage.updatePreference(key, value)) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
             console.error('Error updating preference:', error);
@@ -180,7 +258,7 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:set-keybinds', async (event, keybinds) => {
         try {
-            storage.setKeybinds(keybinds);
+            if ((await storage.setKeybinds(keybinds)) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
             console.error('Error setting keybinds:', error);
@@ -190,6 +268,7 @@ function setupStorageIpcHandlers() {
 
     // ============ HISTORY ============
     ipcMain.handle('storage:get-all-sessions', async () => {
+        await storage.flushStorage();
         try {
             return { success: true, data: storage.getAllSessions() };
         } catch (error) {
@@ -199,6 +278,7 @@ function setupStorageIpcHandlers() {
     });
 
     ipcMain.handle('storage:get-session', async (event, sessionId) => {
+        await storage.flushStorage();
         try {
             return { success: true, data: storage.getSession(sessionId) };
         } catch (error) {
@@ -209,7 +289,7 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:save-session', async (event, sessionId, data) => {
         try {
-            storage.saveSession(sessionId, data);
+            if ((await storage.saveSession(sessionId, data)) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
             console.error('Error saving session:', error);
@@ -219,7 +299,7 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:delete-session', async (event, sessionId) => {
         try {
-            storage.deleteSession(sessionId);
+            if ((await storage.deleteSession(sessionId)) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
             console.error('Error deleting session:', error);
@@ -229,7 +309,7 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:delete-all-sessions', async () => {
         try {
-            storage.deleteAllSessions();
+            if ((await storage.deleteAllSessions()) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
             console.error('Error deleting all sessions:', error);
@@ -250,7 +330,7 @@ function setupStorageIpcHandlers() {
     // ============ CLEAR ALL ============
     ipcMain.handle('storage:clear-all', async () => {
         try {
-            storage.clearAllData();
+            if ((await storage.clearAllData()) === false) throw new Error('Could not persist settings; check OS secure storage');
             return { success: true };
         } catch (error) {
             console.error('Error clearing all data:', error);
@@ -260,6 +340,13 @@ function setupStorageIpcHandlers() {
 }
 
 function setupGeneralIpcHandlers() {
+    ipcMain.handle('capture:state', (_event, state) => {
+        if (quitting) return { success: true };
+        monitor.gauges.audioCaptureActive = state.active;
+        if (tray && !tray.isDestroyed()) tray.setToolTip(state.active ? 'WeHelp — audio capture active' : 'WeHelp — audio idle');
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('capture-state', state);
+        return { success: true };
+    });
     ipcMain.handle('get-app-version', async () => {
         return app.getVersion();
     });
@@ -282,14 +369,6 @@ function setupGeneralIpcHandlers() {
         } catch (error) {
             console.error('Error opening external URL:', error);
             return { success: false, error: error.message };
-        }
-    });
-
-    ipcMain.on('update-keybinds', (event, newKeybinds) => {
-        if (mainWindow) {
-            // Also save to storage
-            storage.setKeybinds(newKeybinds);
-            updateGlobalShortcuts(newKeybinds, mainWindow, sendToRenderer, geminiSessionRef);
         }
     });
 

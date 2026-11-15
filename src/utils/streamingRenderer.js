@@ -206,7 +206,7 @@
                 block.renderedHtml = text;
             }
 
-            this._scheduleDebouncedMarkdown();
+            // Format only completed blocks; keep the growing block as incremental text.
         }
 
         /** Occasionally upgrade the *last block only* to formatted Markdown. */
@@ -231,7 +231,12 @@
             if (!this.renderMarkdown) return;
             const html = this.renderMarkdown(block.text);
             if (html == null) return;
-            block.el.innerHTML = html;
+            block.el.innerHTML = window.DOMPurify.sanitize(html, {
+                USE_PROFILES: { html: true },
+                FORBID_TAGS: ['style', 'iframe', 'form'],
+                FORBID_ATTR: ['style'],
+                ALLOW_DATA_ATTR: false,
+            });
             block.el.classList.add('markdown-rendered');
             block.renderedHtml = null; // next token falls back to plain-append path
         }

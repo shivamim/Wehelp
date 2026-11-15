@@ -1,22 +1,26 @@
 {
-    "name": "cheating-daddy",
-    "productName": "cheating-daddy",
-    "version": "0.8.0",
-    "description": "cheating daddy",
+    "name": "wehelp",
+    "productName": "WeHelp",
+    "version": "2.0.0",
+    "description": "Real-time multimodal AI desktop assistant",
     "main": "src/index.js",
     "scripts": {
         "start": "electron-forge start",
         "package": "electron-forge package",
         "make": "electron-forge make",
         "publish": "electron-forge publish",
-        "lint": "echo \"No linting configured\""
+        "lint": "echo \"No linting configured\"",
+        "test": "node --test tests/*.test.js",
+        "benchmark": "node benchmarks/pipeline.js",
+        "check": "node scripts/check.js",
+        "smoke:electron": "electron scripts/electron-smoke.cjs"
     },
     "keywords": [
-        "cheating daddy",
-        "cheating daddy ai",
-        "cheating daddy ai assistant",
-        "cheating daddy ai assistant for interviews",
-        "cheating daddy ai assistant for interviews"
+        "wehelp",
+        "desktop assistant",
+        "real-time audio",
+        "multimodal",
+        "electron"
     ],
     "author": {
         "name": "sohzm",
@@ -24,9 +28,10 @@
     },
     "license": "GPL-3.0",
     "dependencies": {
-        "@google/genai": "^1.2.0",
+        "@google/genai": "3.3.0",
         "electron-squirrel-startup": "^1.0.1",
-        "ws": "^8.19.0"
+        "ws": "^8.19.0",
+        "dompurify": "^3.3.0"
     },
     "devDependencies": {
         "@electron-forge/cli": "^7.8.1",
@@ -39,6 +44,6 @@
         "@electron-forge/plugin-fuses": "^7.8.1",
         "@electron/fuses": "^1.8.0",
         "@reforged/maker-appimage": "^5.0.0",
-        "electron": "^30.0.5"
+        "electron": "45.3.2"
     }
 }

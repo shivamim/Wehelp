@@ -128,7 +128,7 @@ async function downloadFile(url, destinationPath, onProgress, signal) {
     }
 }
 
-async function installVerifiedFile({ url, destinationPath, sha256, executable, onProgress, signal }) {
+async function installVerifiedFile({ url, destinationPath, sha256, executable, onProgress, signal, offline = false }) {
     fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
 
     if (await fileMatchesChecksum(destinationPath, sha256)) {
@@ -138,6 +138,7 @@ async function installVerifiedFile({ url, destinationPath, sha256, executable, o
         return destinationPath;
     }
 
+    if (offline) throw new Error(`Offline mode: verified ${path.basename(destinationPath)} is not cached. Download it in Local AI mode first.`);
     const temporaryPath = await downloadFile(url, destinationPath, onProgress, signal);
     const downloadedSha256 = await calculateSha256(temporaryPath);
 
@@ -156,7 +157,7 @@ async function installVerifiedFile({ url, destinationPath, sha256, executable, o
     return destinationPath;
 }
 
-async function ensureNativeBinary(type, onProgress, signal) {
+async function ensureNativeBinary(type, onProgress, signal, offline = false) {
     const release = getPlatformReleases()[type];
     const destinationPath = path.join(getBinariesDirectory(), release.filename);
 
@@ -167,6 +168,7 @@ async function ensureNativeBinary(type, onProgress, signal) {
         executable: true,
         onProgress,
         signal,
+        offline,
     });
 }
 
@@ -180,7 +182,7 @@ function normalizeWhisperModel(modelName) {
     return legacyModels[modelName] || modelName || 'tiny.en';
 }
 
-async function ensureWhisperModel(modelName, onProgress, signal) {
+async function ensureWhisperModel(modelName, onProgress, signal, offline = false) {
     const normalizedModel = normalizeWhisperModel(modelName);
     const model = WHISPER_MODELS[normalizedModel];
 
@@ -196,6 +198,7 @@ async function ensureWhisperModel(modelName, onProgress, signal) {
         executable: false,
         onProgress,
         signal,
+        offline,
     });
 }
 
@@ -218,6 +221,8 @@ function parseHuggingFaceModelReference(modelReference) {
         throw new Error('Language model reference contains unsupported characters');
     }
 
+    if (repository.split('/').some(part => part === '.' || part === '..') || quant === '.' || quant === '..')
+        throw new Error('Invalid local model repository');
     return {
         repository,
         quant,
@@ -266,7 +271,7 @@ async function resolveHuggingFaceGguf(modelReference, signal) {
     };
 }
 
-async function ensureLlamaModel(modelReference, onModelProgress, onProjectorProgress, signal) {
+async function ensureLlamaModel(modelReference, onModelProgress, onProjectorProgress, signal, offline = false) {
     if (path.isAbsolute(modelReference)) {
         if (!fs.existsSync(modelReference)) {
             throw new Error(`Language model does not exist: ${modelReference}`);
@@ -283,7 +288,21 @@ async function ensureLlamaModel(modelReference, onModelProgress, onProjectorProg
         };
     }
 
-    const model = await resolveHuggingFaceGguf(modelReference, signal);
+    const parsed = parseHuggingFaceModelReference(modelReference);
+    const manifestPath = path.join(getModelsDirectory(), 'llama', parsed.repository, `verified-${parsed.quant}.json`);
+    const model = offline
+        ? JSON.parse(
+              await fs.promises.readFile(manifestPath, 'utf8').catch(() => {
+                  throw new Error('Offline mode: model checksum manifest missing; download the local model while online first');
+              })
+          )
+        : await resolveHuggingFaceGguf(modelReference, signal);
+    if (
+        model.repository !== parsed.repository ||
+        !/^[a-f0-9]{64}$/i.test(model.model?.sha256 || '') ||
+        !/^[a-f0-9]{64}$/i.test(model.projector?.sha256 || '')
+    )
+        throw new Error('Invalid cached model checksum manifest');
     const repositoryDirectory = path.join(getModelsDirectory(), 'llama', model.repository);
     const modelPath = await installVerifiedFile({
         url: `https://huggingface.co/${encodePathParts(model.repository)}/resolve/main/${encodePathParts(model.model.path)}`,
@@ -292,6 +311,7 @@ async function ensureLlamaModel(modelReference, onModelProgress, onProjectorProg
         executable: false,
         onProgress: onModelProgress,
         signal,
+        offline,
     });
     const projectorPath = await installVerifiedFile({
         url: `https://huggingface.co/${encodePathParts(model.repository)}/resolve/main/${encodePathParts(model.projector.path)}`,
@@ -300,12 +320,12 @@ async function ensureLlamaModel(modelReference, onModelProgress, onProjectorProg
         executable: false,
         onProgress: onProjectorProgress,
         signal,
+        offline,
     });
 
-    return {
-        modelPath,
-        projectorPath,
-    };
+    if (!offline) await fs.promises.writeFile(manifestPath + '.tmp', JSON.stringify(model));
+    if (!offline) await fs.promises.rename(manifestPath + '.tmp', manifestPath);
+    return { modelPath, projectorPath };
 }
 
 async function getAvailablePort() {
@@ -322,10 +342,10 @@ async function getAvailablePort() {
 
 function attachProcessLogging(childProcess, name) {
     childProcess.stdout.on('data', data => {
-        process.stdout.write(`[${name}] ${data}`);
+        if (process.env.DEBUG_NATIVE) process.stdout.write(`[${name}] ${data}`);
     });
     childProcess.stderr.on('data', data => {
-        process.stderr.write(`[${name}] ${data}`);
+        if (process.env.DEBUG_NATIVE) process.stderr.write(`[${name}] ${data}`);
     });
 }
 
@@ -336,6 +356,9 @@ function startNativeServer({ executablePath, arguments: serverArguments, name, e
         windowsHide: true,
     });
 
+    childProcess.on('error', error => {
+        childProcess.startError = error;
+    });
     attachProcessLogging(childProcess, name);
     return childProcess;
 }
@@ -344,12 +367,14 @@ async function waitForServer(url, childProcess, timeoutMs) {
     const startedAt = Date.now();
 
     while (Date.now() - startedAt < timeoutMs) {
+        if (childProcess.startError) throw childProcess.startError;
         if (childProcess.exitCode !== null) {
             throw new Error(`Native server exited with code ${childProcess.exitCode}`);
         }
 
+        if (childProcess.killed) throw new DOMException('Server initialization cancelled', 'AbortError');
         try {
-            const response = await fetch(url);
+            const response = await fetch(url, { signal: AbortSignal.timeout(1000) });
             if (response.ok) {
                 return;
             }

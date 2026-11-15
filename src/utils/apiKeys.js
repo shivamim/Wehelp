@@ -223,7 +223,8 @@ class SecretStore {
     constructor(configDir) {
         this.configDir = configDir;
         // macOS Keychain / Linux libsecret are interactive-safe; Windows uses DPAPI file.
-        this.useKeychain = (process.platform === 'darwin' || process.platform === 'linux') && hasKeychain(configDir);
+        this.useKeychain = false;
+        this.safeStorage = require('electron').safeStorage;
         this.memory = null; // last known good snapshot — hot reads never hit disk/keychain
     }
 
@@ -244,8 +245,15 @@ class SecretStore {
             const file = this._encFilePath();
             if (fs.existsSync(file)) {
                 const record = JSON.parse(fs.readFileSync(file, 'utf8'));
-                const json = decryptSecrets(this.configDir, record);
-                if (json) return JSON.parse(json);
+                const json =
+                    record.scheme === 'electron-safe-storage'
+                        ? this.safeStorage.decryptString(Buffer.from(record.payload, 'base64'))
+                        : decryptSecrets(this.configDir, record);
+                if (json) {
+                    const secrets = JSON.parse(json);
+                    if (record.scheme !== 'electron-safe-storage' && this.safeStorage.isEncryptionAvailable()) this.writeAll(secrets);
+                    return secrets;
+                }
             }
         } catch (e) {
             console.warn('[Keys] Could not read encrypted secrets:', e.message);
@@ -262,6 +270,11 @@ class SecretStore {
 
     writeAll(secrets) {
         const next = { ...secrets };
+        if (Object.keys(next).length === 0) {
+            fs.rmSync(this._encFilePath(), { force: true });
+            this.memory = {};
+            return true;
+        }
         let ok;
         if (this.useKeychain) {
             ok = true;
@@ -274,8 +287,11 @@ class SecretStore {
         } else {
             try {
                 fs.mkdirSync(this.configDir, { recursive: true });
-                const record = encryptSecrets(this.configDir, JSON.stringify(next));
-                fs.writeFileSync(this._encFilePath(), JSON.stringify(record), { mode: 0o600 });
+                if (!this.safeStorage.isEncryptionAvailable() || this.safeStorage.getSelectedStorageBackend?.() === 'basic_text')
+                    throw new Error('OS secure credential storage is unavailable; configure a keychain and restart');
+                const record = { scheme: 'electron-safe-storage', payload: this.safeStorage.encryptString(JSON.stringify(next)).toString('base64') };
+                fs.writeFileSync(this._encFilePath() + '.tmp', JSON.stringify(record), { mode: 0o600 });
+                fs.renameSync(this._encFilePath() + '.tmp', this._encFilePath());
             } catch (e) {
                 console.error('[Keys] Could not persist secrets:', e.message);
                 return false;
@@ -294,8 +310,7 @@ class SecretStore {
         if (Object.keys(migrated).length === 0) return false;
         const existing = this.readAll();
         const merged = { ...migrated, ...existing }; // existing secure values win
-        this.writeAll(merged);
-        return true;
+        return this.writeAll(merged);
     }
 }
 
@@ -343,7 +358,7 @@ class ApiKeyManager {
 
     setSecret(name, value) {
         this._ensureMigrated();
-        const all = this.store.readAll();
+        const all = { ...this.store.readAll() };
         const normalized = normalizeKey(value);
         if (normalized) all[name] = normalized;
         else delete all[name];
@@ -393,8 +408,8 @@ class ApiKeyManager {
         const cached = this.getCachedVerification(provider);
         if (cached && cached.key === key) return { valid: cached.valid, status: cached.status, error: cached.error };
 
-        if (this.inflight[provider]) {
-            const entry = await this.inflight[provider];
+        if (this.inflight[provider]?.key === key) {
+            const entry = await this.inflight[provider].promise;
             return { valid: entry.valid, status: entry.status, error: entry.error };
         }
 
@@ -404,9 +419,9 @@ class ApiKeyManager {
                 return entry;
             })
             .finally(() => {
-                delete this.inflight[provider];
+                if (this.inflight[provider]?.promise === work) delete this.inflight[provider];
             });
-        this.inflight[provider] = work;
+        this.inflight[provider] = { key, promise: work };
 
         const entry = await work;
         return { valid: entry.valid, status: entry.status, error: entry.error };

@@ -1,3 +1,5 @@
+import './EngineSettings.js';
+import { ipcRenderer } from '../../utils/bridge.js';
 import { html, css, LitElement } from '../../assets/lit-core-2.7.4.min.js';
 import { unifiedPageStyles } from './sharedPageStyles.js';
 
@@ -324,8 +326,7 @@ export class CustomizeView extends LitElement {
 
     async saveKeybinds() {
         await cheatingDaddy.storage.setKeybinds(this.keybinds);
-        if (window.require) {
-            const { ipcRenderer } = window.require('electron');
+        if (window.wehelp) {
             ipcRenderer.send('update-keybinds', this.keybinds);
         }
     }
@@ -371,9 +372,8 @@ export class CustomizeView extends LitElement {
     async handleGoogleSearchChange(e) {
         this.googleSearchEnabled = e.target.checked;
         await cheatingDaddy.storage.updatePreference('googleSearchEnabled', this.googleSearchEnabled);
-        if (window.require) {
+        if (window.wehelp) {
             try {
-                const { ipcRenderer } = window.require('electron');
                 await ipcRenderer.invoke('update-google-search-setting', this.googleSearchEnabled);
             } catch (error) {
                 console.error('Failed to notify main process:', error);
@@ -464,8 +464,7 @@ export class CustomizeView extends LitElement {
     async resetKeybinds() {
         this.keybinds = this.getDefaultKeybinds();
         await cheatingDaddy.storage.setKeybinds(null);
-        if (window.require) {
-            const { ipcRenderer } = window.require('electron');
+        if (window.wehelp) {
             ipcRenderer.send('update-keybinds', this.keybinds);
         }
         this.requestUpdate();
@@ -498,8 +497,7 @@ export class CustomizeView extends LitElement {
             // Restore keybinds
             this.keybinds = this.getDefaultKeybinds();
             await cheatingDaddy.storage.setKeybinds(null);
-            if (window.require) {
-                const { ipcRenderer } = window.require('electron');
+            if (window.wehelp) {
                 ipcRenderer.send('update-keybinds', this.keybinds);
             }
 
@@ -551,8 +549,7 @@ export class CustomizeView extends LitElement {
                 this.clearStatusMessage = 'Closing application...';
                 this.requestUpdate();
                 setTimeout(async () => {
-                    if (window.require) {
-                        const { ipcRenderer } = window.require('electron');
+                    if (window.wehelp) {
                         await ipcRenderer.invoke('quit-application');
                     }
                 }, 1000);
@@ -578,11 +575,16 @@ export class CustomizeView extends LitElement {
                             <option value="speaker_only">Speaker Only (Interviewer)</option>
                             <option value="mic_only">Microphone Only (Me)</option>
                             <option value="both">Both Speaker and Microphone</option>
+                            <option value="text_only">Text only (no audio capture)</option>
                         </select>
                     </div>
-                    ${this.audioMode !== 'speaker_only' ? html`
-                        <div class="warning-callout">May cause unexpected behavior. Only change this if you know what you're doing.</div>
-                    ` : ''}
+                    ${
+                        this.audioMode !== 'speaker_only'
+                            ? html`
+                                  <div class="warning-callout">Only the selected inputs are captured. Stop Session releases every audio device.</div>
+                              `
+                            : ''
+                    }
                     <div class="form-group">
                         <label class="form-label">Image Quality</label>
                         <select class="control" .value=${this.selectedImageQuality} @change=${this.handleImageQualitySelect}>
@@ -662,20 +664,22 @@ export class CustomizeView extends LitElement {
         return html`
             <section class="surface">
                 <div class="surface-title">Keyboard Shortcuts</div>
-                ${this.getKeybindActions().map(action => html`
-                    <div class="keybind-row">
-                        <span class="keybind-name">${action.name}</span>
-                        <input
-                            type="text"
-                            class="control keybind-input"
-                            .value=${this.keybinds[action.key]}
-                            data-action=${action.key}
-                            @keydown=${this.handleKeybindInput}
-                            @focus=${this.handleKeybindFocus}
-                            readonly
-                        />
-                    </div>
-                `)}
+                ${this.getKeybindActions().map(
+                    action => html`
+                        <div class="keybind-row">
+                            <span class="keybind-name">${action.name}</span>
+                            <input
+                                type="text"
+                                class="control keybind-input"
+                                .value=${this.keybinds[action.key]}
+                                data-action=${action.key}
+                                @keydown=${this.handleKeybindInput}
+                                @focus=${this.handleKeybindFocus}
+                                readonly
+                            />
+                        </div>
+                    `
+                )}
                 <div style="margin-top: var(--space-sm);">
                     <button class="control" style="width:auto;padding:8px 10px;" @click=${this.resetKeybinds}>Reset to defaults</button>
                 </div>
@@ -695,9 +699,11 @@ export class CustomizeView extends LitElement {
                         ${this.isClearing ? 'Clearing...' : 'Delete all data'}
                     </button>
                 </div>
-                ${this.clearStatusMessage ? html`
-                    <div class="status ${this.clearStatusType === 'success' ? 'success' : 'error'}">${this.clearStatusMessage}</div>
-                ` : ''}
+                ${
+                    this.clearStatusMessage
+                        ? html` <div class="status ${this.clearStatusType === 'success' ? 'success' : 'error'}">${this.clearStatusMessage}</div> `
+                        : ''
+                }
             </section>
         `;
     }
@@ -707,10 +713,8 @@ export class CustomizeView extends LitElement {
             <div class="unified-page">
                 <div class="unified-wrap">
                     <div class="page-title">Settings</div>
-                    ${this.renderAudioSection()}
-                    ${this.renderLanguageSection()}
-                    ${this.renderAppearanceSection()}
-                    ${this.renderKeyboardSection()}
+                    <engine-settings></engine-settings>
+                    ${this.renderAudioSection()} ${this.renderLanguageSection()} ${this.renderAppearanceSection()} ${this.renderKeyboardSection()}
                     ${this.renderPrivacySection()}
                 </div>
             </div>

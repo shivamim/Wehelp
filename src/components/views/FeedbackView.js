@@ -33,11 +33,10 @@ export class FeedbackView extends LitElement {
 
                     <section class="surface">
                         <div class="feedback-embed">
-                            <iframe
-                                class="feedback-iframe"
-                                src=${FEEDBACK_FORM_URL}
-                                title="Feedback Form"
-                            ></iframe>
+                            <p>Open the feedback form in your browser.</p>
+                            <button class="control" @click=${() => window.wehelp.operations['open-external'](FEEDBACK_FORM_URL)}>
+                                Open feedback form
+                            </button>
                         </div>
                     </section>
                 </div>
