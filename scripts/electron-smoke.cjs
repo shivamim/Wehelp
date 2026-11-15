@@ -20,6 +20,26 @@ app.on('browser-window-created', (_event, win) => {
                 const isolation = { require: typeof require, process: typeof process, bridge: !!window.wehelp, genericInvoke: typeof window.wehelp.invoke };
                 const config = await window.wehelp.operations['storage:get-config']();
                 if (!config.success) throw new Error('Storage unavailable');
+                app.currentView = 'main'; await app.updateComplete;
+                const homeBeforeStart = app.shadowRoot.querySelector('main-view'); await homeBeforeStart.updateComplete;
+                if (window.wehelp.platform === 'win32') {
+                    await homeBeforeStart._saveGeminiKey('credential-persistence-fixture');
+                    if (homeBeforeStart._credentialError || !homeBeforeStart._hasGeminiKey) throw new Error('Windows secure key save failed: ' + homeBeforeStart._credentialError);
+                    if (await cheatingDaddy.storage.getApiKey() !== 'configured') throw new Error('Saved key marker missing');
+                }
+                const originalKeyGetter = cheatingDaddy.storage.getApiKey;
+                const originalInitialize = cheatingDaddy.initializeGemini;
+                cheatingDaddy.storage.getApiKey = async () => 'configured';
+                cheatingDaddy.initializeGemini = async () => { throw new Error('Fixture model is not available'); };
+                try { await app.handleStart(); } finally {
+                    cheatingDaddy.storage.getApiKey = originalKeyGetter;
+                    cheatingDaddy.initializeGemini = originalInitialize;
+                }
+                if (window.wehelp.platform === 'win32') await cheatingDaddy.storage.setApiKey('');
+                await app.updateComplete;
+                const home = app.shadowRoot.querySelector('main-view'); await home.updateComplete;
+                if (!home.shadowRoot.textContent.includes('Fixture model is not available')) throw new Error('Startup failure is hidden on Home');
+                if (home.shadowRoot.querySelector('.start-button').disabled) throw new Error('Start remains disabled after failure');
                 app.currentView = 'customize'; await app.updateComplete;
                 const settings = app.shadowRoot.querySelector('customize-view'); await settings.updateComplete;
                 const engine = settings.shadowRoot.querySelector('engine-settings'); await engine.load(); await engine.updateComplete;
@@ -45,7 +65,7 @@ app.on('browser-window-created', (_event, win) => {
                 if (!chunks || !allTracksStopped || unsafeDOM) throw new Error('Worklet capture/cleanup or sanitized DOM failed');
                 app.currentView = 'main'; await app.updateComplete;
                 await window.wehelp.operations['close-session']();
-                return { isolation, modelCount: models.length, metrics: await window.wehelp.operations['performance:snapshot'](), unsafeExecuted: !!window.__unsafe, settings: !!engine, workletChunks: chunks, allTracksStopped };
+                return { isolation, modelCount: models.length, metrics: await window.wehelp.operations['performance:snapshot'](), unsafeExecuted: !!window.__unsafe, settings: !!engine, startupFailureVisible: true, workletChunks: chunks, allTracksStopped };
             })()`);
             if (
                 result.isolation.require !== 'undefined' ||
