@@ -9,7 +9,7 @@ let micAudioProcessor = null;
 let audioBuffer = [];
 const SAMPLE_RATE = 24000;
 const AUDIO_CHUNK_DURATION = 0.1; // seconds
-const BUFFER_SIZE = 4096; // Increased buffer size for smoother audio
+const BUFFER_SIZE = 1024; // ~43 ms at 24 kHz; keep capture latency below the 100 ms transport chunk.
 
 let hiddenVideo = null;
 let offscreenCanvas = null;
