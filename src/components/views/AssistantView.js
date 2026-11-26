@@ -466,6 +466,22 @@ export class AssistantView extends LitElement {
         }
     }
 
+    async toggleAudioCapture() {
+        if (this._captureChanging) return;
+        this._captureChanging = true;
+        this.requestUpdate();
+        try {
+            if (this._capturePaused) {
+                if (await cheatingDaddy.resumeCapture()) this._capturePaused = false;
+            } else {
+                this._capturePaused = await cheatingDaddy.pauseCapture();
+            }
+        } finally {
+            this._captureChanging = false;
+            this.requestUpdate();
+        }
+    }
+
     connectedCallback() {
         super.connectedCallback();
 
@@ -836,20 +852,12 @@ export class AssistantView extends LitElement {
                 <button class="analyze-btn" @click=${() => ipcRenderer.invoke('cancel-request')}>Cancel answer</button>
                 <button
                     class="analyze-btn"
-                    @click=${async () => {
-                        if (this._capturePaused) {
-                            await cheatingDaddy.startCapture();
-                            this._capturePaused = false;
-                        } else {
-                            await cheatingDaddy.pauseCapture();
-                            this._capturePaused = true;
-                        }
-                        this.requestUpdate();
-                    }}
+                    ?disabled=${this._captureChanging || (!this._audioActive && !this._capturePaused)}
+                    @click=${this.toggleAudioCapture}
                 >
                     ${this._capturePaused ? 'Resume audio' : 'Pause audio'}
                 </button>
-                <span role="status">${this._audioActive ? 'Audio capture active' : 'No audio capture'}</span>
+                <span role="status">${this._audioActive ? 'Audio capture active' : this._capturePaused ? 'Audio paused' : 'No audio capture'}</span>
                 <button class="analyze-btn ${this.isAnalyzing ? 'analyzing' : ''}" @click=${this.handleScreenAnswer}>
                     <canvas class="analyze-canvas"></canvas>
                     <span class="analyze-btn-content">

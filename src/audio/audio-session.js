@@ -9,17 +9,13 @@ export class AudioSession {
     }
     async add(stream, source, chunkMs = 100) {
         const generation = this.generation;
-        const resource = { stream, context: null, node: null, source: null };
+        const resource = { stream, context: null, node: null, source: null, trackEvents: new AbortController() };
         this.resources.add(resource);
         try {
             const context = (resource.context = new AudioContext({ sampleRate: 24000, latencyHint: 'interactive' }));
             resource.source = context.createMediaStreamSource(stream);
             await context.audioWorklet.addModule(new URL('./audio-worklet.js', import.meta.url));
-            if (generation !== this.generation) {
-                if (context.state !== 'closed') await context.close().catch(() => {});
-                stream.getTracks().forEach(t => t.stop());
-                return;
-            }
+            if (generation !== this.generation) return;
             const node = (resource.node = new AudioWorkletNode(context, 'wehelp-pcm', {
                 processorOptions: { chunkMs },
                 numberOfOutputs: 1,
@@ -57,12 +53,12 @@ export class AudioSession {
                     () => {
                         if (generation === this.generation) this.fail(new Error('Audio device disconnected'));
                     },
-                    { once: true }
+                    { once: true, signal: resource.trackEvents.signal }
                 )
             );
             await context.resume();
         } catch (error) {
-            await this.stop();
+            if (generation === this.generation) await this.stop({ keepStreams: true });
             throw error;
         }
     }
@@ -70,14 +66,15 @@ export class AudioSession {
         this.stop();
         this.onError(error);
     }
-    async stop() {
+    async stop({ keepStreams = false } = {}) {
         this.generation++;
         const resources = [...this.resources];
         this.resources.clear();
         this.pending = 0;
         const closes = [];
-        for (const { stream, context, node, source } of resources) {
-            stream.getTracks().forEach(track => track.stop());
+        for (const { stream, context, node, source, trackEvents } of resources) {
+            trackEvents?.abort();
+            if (!keepStreams) stream.getTracks().forEach(track => track.stop());
             if (node) {
                 node.port.onmessage = null;
                 node.port.close();

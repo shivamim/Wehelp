@@ -57,7 +57,7 @@ function installCapturePermissions({ session, window, trustedURL, dialog, deskto
                 defaultId: 1,
                 cancelId: 1,
                 message: request.audioRequested ? 'Share primary display and system audio with WeHelp?' : 'Share primary display with WeHelp?',
-                detail: 'Screenshots are analyzed only when requested. Audio is captured only while your session is active. Stop Session ends sharing.',
+                detail: 'Screenshots are analyzed only when requested. Pause audio stops audio processing while sharing stays open. Stop Session ends sharing.',
             });
             if (result.response !== 0 || !isMain()) return finish({});
             const sources = await desktopCapturer.getSources({ types: ['screen'] });
