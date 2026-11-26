@@ -16,6 +16,8 @@ let liveEpoch = 0;
 let resumptionHandle;
 let reconnectTimer;
 let resolveReconnectWait;
+let reconnectTask;
+let captureSuspended = false;
 let asrControllers = new Set();
 const { normalizeKey, maskKey } = require('./apiKeys');
 
@@ -110,7 +112,6 @@ function getRuntimeConfig() {
 // Reconnection variables
 let isUserClosing = false;
 let sessionParams = null;
-let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY = 2000;
 
@@ -302,11 +303,12 @@ async function sendImageToGroq(data, prompt) {
 }
 
 async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'interview', language = 'en-US', isReconnect = false) {
-    const epoch = liveEpoch;
     if (isInitializingSession) {
         console.log('Session initialization already in progress');
         return false;
     }
+
+    const epoch = ++liveEpoch;
 
     // Normalize the key once at the boundary — silently fixes trailing spaces /
     // quotes pasted from docs, which is a top cause of "invalid API key" errors.
@@ -343,9 +345,9 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
     // Store params for reconnection
     if (!isReconnect) {
         sessionParams = { apiKey: normalizedKey, customPrompt, profile, language };
-        reconnectAttempts = 0;
     }
 
+    let socketClosed = false;
     const config = getRuntimeConfig();
     const transcriptionOnly = usesExternalAnswers();
     const liveModel = transcriptionOnly ? config.transcriptionModel : config.geminiLiveModel;
@@ -389,10 +391,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     if (transcription) {
                         currentTranscription = transcription;
                         monitor.gauges.finalTranscriptionAt = monitor.now();
-                        if (transcriptionOnly)
-                            generation
-                                .generate(transcription, { speechEnd: monitor.gauges.speechEnd })
-                                .catch(error => sendToRenderer('update-status', error.message));
+                        if (transcriptionOnly) generation.generate(transcription).catch(error => sendToRenderer('update-status', error.message));
                     }
                     if (!transcriptionOnly) {
                         for (const part of content.modelTurn?.parts || [])
@@ -430,6 +429,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                 },
                 onclose: function (e) {
                     if (epoch !== liveEpoch) return;
+                    socketClosed = true;
                     console.log('Session closed:', e.reason);
                     logTransportEvent('gemini.live.closed', {
                         reason: e.reason,
@@ -445,13 +445,8 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
 
                     // Initial handshake failures are returned to Home, not retried in the background.
                     if (isInitializingSession) return;
-                    // Attempt reconnection
-                    if (sessionParams && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-                        attemptReconnect();
-                    } else {
-                        closeTransportLog();
-                        sendToRenderer('update-status', 'Session closed');
-                    }
+                    global.geminiSessionRef.current = null;
+                    startReconnect();
                 },
             },
             config: transcriptionOnly
@@ -499,7 +494,8 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         } finally {
             clearTimeout(connectTimer);
         }
-        if (epoch !== liveEpoch) {
+        if (epoch !== liveEpoch || socketClosed) {
+            if (socketClosed) throw new Error('Gemini Live closed during setup');
             session.close();
             isInitializingSession = false;
             return null;
@@ -520,71 +516,76 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
     }
 }
 
-async function attemptReconnect() {
-    reconnectAttempts++;
-    console.log(`Reconnection attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
+function providerHealth(state, message) {
+    sendToRenderer('provider-health', { state, message });
+}
 
-    // Clear stale buffers
+function startReconnect() {
+    if (reconnectTask || !sessionParams) return reconnectTask;
+    const params = sessionParams;
+    const task = attemptReconnect(params).finally(() => {
+        if (reconnectTask === task) reconnectTask = undefined;
+    });
+    reconnectTask = task;
+    return task;
+}
+
+async function attemptReconnect(params) {
+    turns.reset();
     messageBuffer = '';
     currentTranscription = '';
-    // Don't reset groqConversationHistory to preserve context across reconnects
-
-    sendToRenderer('update-status', `Reconnecting... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
-
-    // Wait before attempting
-    monitor.gauges.reconnections++;
-    const epoch = liveEpoch;
-    await new Promise(resolve => {
-        resolveReconnectWait = resolve;
-        reconnectTimer = setTimeout(resolve, RECONNECT_DELAY * 2 ** Math.max(0, reconnectAttempts - 1) + Math.random() * 200);
-    });
-    if (epoch !== liveEpoch || !sessionParams) return;
-
-    try {
-        const session = await initializeGeminiSession(
-            sessionParams.apiKey,
-            sessionParams.customPrompt,
-            sessionParams.profile,
-            sessionParams.language,
-            true // isReconnect
-        );
-
-        if (session && global.geminiSessionRef) {
-            global.geminiSessionRef.current = session;
-
-            // Restore context from conversation history via text message
-            const contextMessage = !resumptionHandle && !usesExternalAnswers() ? buildContextMessage() : null;
-            if (contextMessage) {
-                try {
-                    console.log('Restoring conversation context...');
-                    await session.sendRealtimeInput({ text: contextMessage });
-                } catch (contextError) {
-                    console.error('Failed to restore context:', contextError);
-                    // Continue without context - better than failing
-                }
-            }
-
-            // Don't reset reconnectAttempts here - let it reset on next fresh session
-            sendToRenderer('update-status', 'Reconnected! Listening...');
-            console.log('Session reconnected successfully');
-            return true;
+    sendToRenderer('voice-interrupted');
+    for (let attempt = 1; attempt <= MAX_RECONNECT_ATTEMPTS; attempt++) {
+        providerHealth('reconnecting', `Reconnecting to ${params.cloud ? 'Cloud' : 'Gemini'} (${attempt}/${MAX_RECONNECT_ATTEMPTS})…`);
+        await new Promise(resolve => {
+            resolveReconnectWait = resolve;
+            reconnectTimer = setTimeout(resolve, RECONNECT_DELAY * 2 ** (attempt - 1) + Math.random() * 200);
+        });
+        if (params !== sessionParams) return false;
+        resolveReconnectWait = null;
+        if (captureSuspended) {
+            providerHealth('disconnected', 'Connection interrupted during sleep. Retry when back online.');
+            return false;
         }
-    } catch (error) {
-        console.error(`Reconnection attempt ${reconnectAttempts} failed:`, error);
+        monitor.gauges.reconnections++;
+        try {
+            if (params.cloud) {
+                await connectCloud(params.token, params.profile, params.userContext, startReconnect);
+                if (params !== sessionParams) return false;
+                if (!isCloudActive()) continue;
+            } else {
+                const session = await initializeGeminiSession(params.apiKey, params.customPrompt, params.profile, params.language, true);
+                if (params !== sessionParams) return false;
+                if (!session) continue;
+                global.geminiSessionRef.current = session;
+                const contextMessage = !resumptionHandle && !usesExternalAnswers() ? buildContextMessage() : null;
+                if (contextMessage) {
+                    try {
+                        await session.sendRealtimeInput({ text: contextMessage });
+                    } catch {
+                        console.warn('Could not restore Gemini Live context.');
+                    }
+                }
+                if (params !== sessionParams) return false;
+                if (global.geminiSessionRef.current !== session) continue;
+            }
+            providerHealth('connected', '');
+            sendToRenderer('update-status', 'Reconnected. Listening…');
+            return true;
+        } catch {
+            if (params !== sessionParams) return false;
+        }
     }
-
-    // If we still have attempts left, try again
-    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-        return attemptReconnect();
-    }
-
-    // Max attempts reached - notify frontend
-    console.log('Max reconnection attempts reached');
-    sendToRenderer('reconnect-failed', {
-        message: 'Tried 3 times to reconnect. Must be upstream/network issues. Try restarting or download updated app from site.',
-    });
-    sessionParams = null;
+    providerHealth('disconnected', 'Provider unavailable. Check your connection and try Reconnect.');
     return false;
+}
+
+function setCaptureSuspended(sleeping) {
+    captureSuspended = sleeping;
+    if (sleeping) {
+        for (const endpoint of endpoints.values()) endpoint.reset();
+        turns.reset();
+    }
 }
 
 function killExistingSystemAudioDump() {
@@ -619,9 +620,17 @@ async function startMacOSAudioCapture(geminiSessionRef) {
         },
     };
 
-    systemAudioProc = spawn(systemAudioPath, [], spawnOptions);
+    const proc = (systemAudioProc = spawn(systemAudioPath, [], spawnOptions));
+    const reportStopped = () => {
+        if (systemAudioProc !== proc) return;
+        systemAudioProc = null;
+        sendToRenderer('native-audio-interrupted');
+    };
+    proc.once('close', reportStopped);
+    proc.once('error', reportStopped);
 
-    if (!systemAudioProc.pid) {
+    if (!proc.pid) {
+        systemAudioProc = null;
         console.error('Failed to start SystemAudioDump');
         return false;
     }
@@ -636,7 +645,8 @@ async function startMacOSAudioCapture(geminiSessionRef) {
 
     let audioBuffer = Buffer.alloc(0);
 
-    systemAudioProc.stdout.on('data', data => {
+    proc.stdout.on('data', data => {
+        if (systemAudioProc !== proc) return;
         audioBuffer = Buffer.concat([audioBuffer, data]);
 
         while (audioBuffer.length >= CHUNK_SIZE) {
@@ -645,13 +655,7 @@ async function startMacOSAudioCapture(geminiSessionRef) {
 
             const monoChunk = CHANNELS === 2 ? convertStereoToMono(chunk) : chunk;
 
-            if (currentProviderMode === 'cloud') {
-                sendCloudAudio(monoChunk);
-            } else if (currentProviderMode === 'local') {
-                getLocalAi().processLocalAudio(monoChunk);
-            } else {
-                routeAudio(monoChunk).catch(error => sendToRenderer('update-status', error.message));
-            }
+            routeAudio(monoChunk).catch(error => sendToRenderer('update-status', error.message));
 
             if (process.env.DEBUG_AUDIO) {
                 console.log(`Processed audio chunk: ${chunk.length} bytes`);
@@ -665,18 +669,8 @@ async function startMacOSAudioCapture(geminiSessionRef) {
         }
     });
 
-    systemAudioProc.stderr.on('data', data => {
+    proc.stderr.on('data', data => {
         console.error('SystemAudioDump stderr:', data.toString());
-    });
-
-    systemAudioProc.on('close', code => {
-        console.log('SystemAudioDump process closed with code:', code);
-        systemAudioProc = null;
-    });
-
-    systemAudioProc.on('error', err => {
-        console.error('SystemAudioDump process error:', err);
-        systemAudioProc = null;
     });
 
     return true;
@@ -729,6 +723,8 @@ async function shutdownSession() {
     resolveReconnectWait = null;
     isUserClosing = true;
     sessionParams = null;
+    reconnectTask = undefined;
+    providerHealth('connected', '');
     resumptionHandle = undefined;
     generation.stop();
     turns.reset();
@@ -747,13 +743,15 @@ async function shutdownSession() {
 }
 const endpoints = new Map();
 async function routeAudio(pcm, source = 'system') {
+    if (captureSuspended) return { success: true };
     if (!generation.requests.sessionId) return { success: false, error: 'No active session' };
     if (currentProviderMode === 'local') {
         getLocalAi().processLocalAudio(pcm, source);
         return { success: true };
     }
     if (currentProviderMode === 'cloud') {
-        sendCloudAudio(pcm);
+        if (isCloudActive()) sendCloudAudio(pcm);
+        else monitor.gauges.audioDrops++;
         return { success: true };
     }
     const config = getRuntimeConfig();
@@ -765,13 +763,13 @@ async function routeAudio(pcm, source = 'system') {
                 onStart: () => {
                     monitor.gauges.speechStart = monitor.now();
                 },
-                onEnd: async pcm => {
+                onEnd: async (pcm, speechEnd) => {
                     for (const previous of asrControllers) previous.abort();
                     asrControllers.clear();
                     const controller = new AbortController();
                     asrControllers.add(controller);
                     const sessionId = generation.requests.sessionId;
-                    const speechEnd = monitor.now();
+                    const endpointAt = monitor.now();
                     try {
                         const model = generation.registry.get('groq', config.transcriptionModel, 'transcription');
                         const text = await require('../providers/groq').transcribe({
@@ -782,7 +780,7 @@ async function routeAudio(pcm, source = 'system') {
                             language: require('../storage').getPreferences().selectedLanguage,
                         });
                         if (sessionId === generation.requests.sessionId && !controller.signal.aborted && text)
-                            await generation.generate(text, { speechEnd });
+                            await generation.generate(text, { speechEnd, endpointAt });
                     } catch (error) {
                         if (!controller.signal.aborted) sendToRenderer('update-status', 'Transcription error: ' + error.message);
                     } finally {
@@ -792,12 +790,27 @@ async function routeAudio(pcm, source = 'system') {
             });
             endpoints.set(source, endpoint);
         }
-        endpoint.push(pcm);
+        endpoint.push(pcm, monitor.now());
         return { success: true };
     }
     const session = global.geminiSessionRef?.current;
-    if (!session) return { success: false, error: 'No active Gemini connection' };
-    session.sendRealtimeInput({ audio: { data: pcm24to16(pcm).toString('base64'), mimeType: 'audio/pcm;rate=16000' } });
+    if (!session) {
+        monitor.gauges.audioDrops++;
+        return { success: true };
+    }
+    try {
+        session.sendRealtimeInput({ audio: { data: pcm24to16(pcm).toString('base64'), mimeType: 'audio/pcm;rate=16000' } });
+    } catch {
+        monitor.gauges.audioDrops++;
+        global.geminiSessionRef.current = null;
+        liveEpoch++;
+        startReconnect();
+        try {
+            session.close();
+        } catch {
+            // The transport may already be closed.
+        }
+    }
     return { success: true };
 }
 
@@ -805,22 +818,25 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     // Store the geminiSessionRef globally for reconnection access
     global.geminiSessionRef = geminiSessionRef;
 
-    ipcMain.handle('initialize-cloud', async (event, token, profile, userContext) => {
+    ipcMain.handle('initialize-cloud', async (_event, token, profile, userContext) => {
+        if (isInitializingSession || sessionStartPending) return false;
+        sessionStartPending = true;
+        let params;
         try {
+            await shutdownSession();
             currentProviderMode = 'cloud';
+            params = sessionParams = { cloud: true, token, profile, userContext };
             initializeNewSession(profile);
-            setOnTurnComplete((transcription, response) => {
-                saveConversationTurn(transcription, response);
-            });
+            setOnTurnComplete(saveConversationTurn);
             sendToRenderer('session-initializing', true);
-            await connectCloud(token, profile, userContext);
-            sendToRenderer('session-initializing', false);
-            return true;
-        } catch (err) {
-            console.error('[Cloud] Init error:', err);
-            currentProviderMode = 'byok';
-            sendToRenderer('session-initializing', false);
+            await connectCloud(token, profile, userContext, startReconnect);
+            return sessionParams === params && !!isCloudActive();
+        } catch {
+            if (params && sessionParams === params) await shutdownSession();
             return false;
+        } finally {
+            sessionStartPending = false;
+            sendToRenderer('session-initializing', false);
         }
     });
 
@@ -859,7 +875,12 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             monitor.gauges.audioProcessingMs = monitor.now() - start;
         }
     });
+    ipcMain.handle('retry-provider', async () => {
+        if (!sessionParams || captureSuspended || (!sessionParams.cloud && global.geminiSessionRef.current) || isCloudActive()) return false;
+        return startReconnect();
+    });
     ipcMain.handle('pause-audio', () => {
+        for (const endpoint of endpoints.values()) endpoint.reset();
         global.geminiSessionRef?.current?.sendRealtimeInput({ audioStreamEnd: true });
         return { success: true };
     });
@@ -1012,6 +1033,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 
         if (currentProviderMode === 'cloud') {
             try {
+                if (!isCloudActive()) return { success: false, error: 'Cloud disconnected. Reconnect before sending a message.' };
                 sendCloudText(text.trim());
                 return { success: true };
             } catch (error) {
@@ -1109,6 +1131,7 @@ module.exports = {
     setApiKeyManager,
     setRuntimeConfigGetter,
     shutdownSession,
+    setCaptureSuspended,
     generation,
     getEnabledTools,
     getStoredSetting,

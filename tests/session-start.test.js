@@ -93,7 +93,7 @@ test('failed credential persistence remains visible and prevents startup', async
     assert.equal(started, false);
     assert.match(view._credentialError, /secure storage/);
 });
-function geminiModule(connect) {
+function geminiModule(connect, timers = { setTimeout, clearTimeout }, cloud = { closeCloud() {}, isCloudActive: () => false }) {
     const filename = path.resolve('src/utils/gemini.js'),
         relative = createRequire(filename),
         module = { exports: {} },
@@ -121,7 +121,7 @@ function geminiModule(connect) {
             ipcMain: { handle: (name, fn) => handlers.set(name, fn) },
         },
         '../storage': storage,
-        './cloud': { closeCloud() {}, isCloudActive: () => false },
+        './cloud': cloud,
         './transportLogger': { startTransportLog() {}, logTransportEvent() {}, closeTransportLog() {} },
     };
     vm.runInNewContext(
@@ -134,8 +134,7 @@ function geminiModule(connect) {
             Buffer,
             process,
             global: {},
-            setTimeout,
-            clearTimeout,
+            ...timers,
             AbortController,
             AbortSignal,
             DOMException,
@@ -160,6 +159,95 @@ test('successful initialization uses the same structured result contract', async
     const { handlers } = geminiModule(async () => ({ close() {} }));
     const result = await handlers.get('initialize-gemini')({}, undefined, '', 'interview', 'en-US');
     assert.equal(result.success, true);
+});
+test('Gemini disconnect drops audio during reconnect and keeps the conversation open', async () => {
+    const backoffs = [];
+    const sockets = [];
+    const { handlers, events } = geminiModule(
+        async ({ callbacks }) => {
+            const socket = {
+                callbacks,
+                close() {},
+                sent: [],
+                sendRealtimeInput(input) {
+                    this.sent.push(input);
+                },
+            };
+            sockets.push(socket);
+            return socket;
+        },
+        {
+            setTimeout(fn, ms) {
+                if (ms < 3000) backoffs.push(fn);
+                else return setTimeout(fn, ms);
+            },
+            clearTimeout,
+        }
+    );
+    assert.equal((await handlers.get('initialize-gemini')({}, undefined, '')).success, true);
+    events.length = 0;
+    sockets[0].callbacks.onclose({ reason: 'network' });
+    const chunk = { pcm: new ArrayBuffer(4800), source: 'system' };
+    assert.equal((await handlers.get('audio:chunk')({}, chunk)).success, true);
+    assert.equal(sockets[0].sent.length, 0);
+    const reconnect = handlers.get('retry-provider')();
+    backoffs.shift()();
+    assert.equal(await reconnect, true);
+    assert.equal(sockets.length, 2);
+    assert.equal((await handlers.get('audio:chunk')({}, chunk)).success, true);
+    assert.equal(sockets[1].sent.length, 1);
+    assert.ok(events.some(([channel, health]) => channel === 'provider-health' && health.state === 'connected'));
+    assert.ok(!events.some(([channel]) => channel === 'capture-stopped'));
+
+    sockets[1].callbacks.onclose({ reason: 'network again' });
+    const pending = handlers.get('retry-provider')();
+    await handlers.get('close-session')();
+    assert.equal(await pending, false);
+    assert.equal(sockets.length, 2);
+});
+test('Cloud reconnect preserves the local session ID and checks connection before sending', async () => {
+    let active = false;
+    let disconnect;
+    let attempts = 0;
+    let runBackoff;
+    const cloud = {
+        closeCloud() {
+            active = false;
+        },
+        isCloudActive: () => active,
+        setOnTurnComplete() {},
+        connectCloud(_token, _profile, _context, onDisconnect) {
+            active = true;
+            attempts++;
+            disconnect = () => {
+                active = false;
+                onDisconnect();
+            };
+        },
+        sendCloudText() {},
+    };
+    const { handlers, events } = geminiModule(
+        undefined,
+        {
+            setTimeout(fn) {
+                runBackoff = fn;
+            },
+            clearTimeout() {},
+        },
+        cloud
+    );
+    assert.equal(await handlers.get('initialize-cloud')({}, 'token', 'interview', ''), true);
+    const first = await handlers.get('get-current-session')();
+    events.length = 0;
+    disconnect();
+    assert.equal((await handlers.get('send-text-message')({}, 'hello')).success, false);
+    const pending = handlers.get('retry-provider')();
+    runBackoff();
+    assert.equal(await pending, true);
+    assert.equal(attempts, 2);
+    assert.equal((await handlers.get('send-text-message')({}, 'hello')).success, true);
+    assert.deepEqual(await handlers.get('get-current-session')(), first);
+    assert.ok(!events.some(([channel]) => channel === 'capture-stopped'));
 });
 test('global keyboard shortcut uses the same credential-save gate as the Start button', () => {
     const source = fs.readFileSync('src/utils/renderer.js', 'utf8').replace(/\r\n/g, '\n');

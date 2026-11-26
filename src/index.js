@@ -3,13 +3,13 @@ if (require('electron-squirrel-startup')) {
     process.exit(0);
 }
 
-const { app, BrowserWindow, shell, ipcMain, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, shell, ipcMain, Tray, Menu, nativeImage, powerMonitor } = require('electron');
 const { createWindow, updateGlobalShortcuts } = require('./utils/window');
 const { setupGeminiIpcHandlers, stopMacOSAudioCapture, sendToRenderer } = require('./utils/gemini');
 const storage = require('./storage');
 const { applyScreenSharePrivacy } = require('./utils/screen-share-privacy');
 const { ApiKeyManager } = require('./utils/apiKeys');
-const { setApiKeyManager, setRuntimeConfigGetter, shutdownSession, generation } = require('./utils/gemini');
+const { setApiKeyManager, setRuntimeConfigGetter, shutdownSession, generation, setCaptureSuspended } = require('./utils/gemini');
 const { monitor } = require('./engine/performance-monitor');
 monitor.boot = startupStart;
 require('./security/ipc-validation').installIpcValidation(ipcMain);
@@ -56,6 +56,15 @@ app.whenReady()
         setupGeminiIpcHandlers(geminiSessionRef);
         setupStorageIpcHandlers();
         setupGeneralIpcHandlers();
+        for (const [event, sleeping] of [
+            ['suspend', true],
+            ['resume', false],
+        ]) {
+            powerMonitor.on(event, () => {
+                setCaptureSuspended(sleeping);
+                sendToRenderer('capture-power', sleeping);
+            });
+        }
         monitor.resources();
         createMainWindow();
         mainWindow.webContents.once('did-finish-load', () => {

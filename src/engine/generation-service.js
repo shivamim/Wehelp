@@ -18,12 +18,13 @@ class GenerationService {
         this.requests.stop();
         this.history = [];
     }
-    async generate(text, { image, speechEnd } = {}) {
+    async generate(text, { image, speechEnd, endpointAt } = {}) {
         const config = this.getConfig(),
             keys = this.getKeys();
         let { provider, model, profile } = route(this.registry, config, keys, image ? 'vision' : 'text');
         if (provider === 'local') throw new Error('Start a Local AI session for Offline mode');
         const request = this.requests.begin(provider, model.id, image ? 'vision' : 'text', speechEnd);
+        request.endpointAt = endpointAt;
         const id = request.requestId;
         const event = (type, data = {}) =>
             this.emit('response-stream', { requestId: id, sessionId: request.sessionId, sequence: request.sequence++, type, ...data });
@@ -67,6 +68,7 @@ class GenerationService {
             event('start', { provider, model: model.id });
             for (let attempt = 0; ; attempt++) {
                 try {
+                    const attemptStart = this.metrics.now();
                     model.requests++;
                     const iterator = this.adapters[provider].chat({
                         key: keys[provider],
@@ -81,6 +83,7 @@ class GenerationService {
                             tokenDeadline(15000);
                         },
                     });
+                    let observedUsefulText = false;
                     for await (const delta of iterator) {
                         if (!this.requests.current(request)) return { success: false, cancelled: true };
                         request.controller.signal.throwIfAborted();
@@ -93,6 +96,12 @@ class GenerationService {
                         pending += delta;
                         request.chars += delta.length;
                         if (fullText.length > 1000000) throw new Error('Response exceeds application size limit');
+                        if (!observedUsefulText && delta.trim()) {
+                            observedUsefulText = true;
+                            const latency = this.metrics.now() - attemptStart;
+                            model.observedLatencyMs = model.observedLatencyMs == null ? latency : model.observedLatencyMs * 0.75 + latency * 0.25;
+                            model.latencySamples = (model.latencySamples || 0) + 1;
+                        }
                         if (first) flush();
                         else if (!flushTimer) flushTimer = setTimeout(flush, 32);
                     }
@@ -132,7 +141,6 @@ class GenerationService {
             event('complete');
             this.emit('update-status', 'Listening...');
             this.requests.finish(request, 'COMPLETED');
-            model.observedLatencyMs = request.firstToken - request.start;
             return { success: true, model: model.id };
         } catch (error) {
             if (!this.requests.current(request) && !request.controller.signal.aborted) return { success: false, cancelled: true };

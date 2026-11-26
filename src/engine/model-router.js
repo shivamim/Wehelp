@@ -26,7 +26,13 @@ function route(registry, config, keys, operation = 'text') {
             .filter(m => m.provider === provider && m.availability === 'available' && (!m.cooldownUntil || m.cooldownUntil < registry.now()));
         if (!available.length && registry.list(operation).some(m => m.provider === provider && m.availability === 'available'))
             throw new Error('Provider models are cooling down after rate limits; try again shortly');
+        const measured = available.filter(m => m.latencySamples >= 3 && m.failures / Math.max(1, m.requests) < 0.5);
+        const measuredFastest =
+            mode === 'instant' && operation === 'text' && measured.length > 1
+                ? measured.reduce((best, model) => (model.observedLatencyMs < best.observedLatencyMs ? model : best))
+                : null;
         const candidate =
+            measuredFastest ||
             available.find(m => m.id === preferred && m.failures / Math.max(1, m.requests) < 0.5) ||
             available.sort(
                 (a, b) =>

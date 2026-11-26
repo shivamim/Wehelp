@@ -281,6 +281,10 @@ export class EngineSettings extends LitElement {
                     <dd>${ms(m.startupMs)}</dd>
                     <dt>Last visible response</dt>
                     <dd>${ms(m.lastLatencyMs)}</dd>
+                    <dt>Estimated speech end to visible text (Groq transcription)</dt>
+                    <dd>${ms(m.lastSpeechToVisibleMs)} last · ${ms(m.speechToVisibleP95Ms)} P95 · ${m.speechSamples || 0} samples</dd>
+                    <dt>Last speech detection / transcription</dt>
+                    <dd>${ms(m.lastEndpointMs)} / ${ms(m.lastTranscriptionMs)}</dd>
                     <dt>Average / P50</dt>
                     <dd>${ms(m.averageMs)} / ${ms(m.p50Ms)}</dd>
                     <dt>P95 / P99</dt>
@@ -293,8 +297,8 @@ export class EngineSettings extends LitElement {
                     <dd>${m.activeSessions || 0} / ${m.requests || 0}</dd>
                     <dt>Reconnections</dt>
                     <dd>${m.reconnections || 0}</dd>
-                    <dt>Audio backlog</dt>
-                    <dd>${m.audioBacklog || 0}</dd>
+                    <dt>Audio backlog / chunks dropped during disconnects</dt>
+                    <dd>${m.audioBacklog || 0} / ${m.audioDrops || 0}</dd>
                     <dt>Audio transport</dt>
                     <dd>${ms(m.audioTransportMs)}</dd>
                     <dt>Event loop P95</dt>

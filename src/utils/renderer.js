@@ -208,17 +208,30 @@ let captureActive = false;
 let audioPaused = false;
 let audioInputs = [];
 let nativeAudio = false;
+let audioRecovery = '';
+let suspended = false;
+let pausedForSleep = false;
+let defaultMic = null;
+
+function reportCapture(active) {
+    return ipcRenderer.invoke('capture:state', { active, paused: audioPaused, recovery: audioRecovery, pausedForSleep });
+}
 
 async function addAudioInput(stream, source, chunkMs) {
     audioInputs.push({ stream, source, chunkMs });
     await audioSession.add(stream, source, chunkMs);
+    if (source === 'mic' && !preferencesCache.audioDeviceId) await rememberDefaultMic();
 }
 const audioSession = new AudioSession({
     send: chunk => ipcRenderer.invoke('audio:chunk', chunk),
     onError: error => {
-        stopCapture();
-        ipcRenderer.invoke('close-session');
-        cheatingDaddy.setStatus('Capture stopped: ' + error.message);
+        console.warn('Audio processing stopped:', error.message);
+        if (!captureActive) return;
+        audioPaused = true;
+        for (const { stream } of audioInputs) stream.getAudioTracks().forEach(track => (track.enabled = false));
+        audioRecovery = 'Audio input interrupted. Reconnect your device, then retry audio.';
+        if (nativeAudio) ipcRenderer.invoke('stop-macos-audio').catch(console.warn);
+        reportCapture(false).catch(console.warn);
     },
     onMetrics: values => {
         ipcRenderer.invoke('performance:audio', values).catch(() => {});
@@ -228,6 +241,45 @@ async function authorizeScreen(withAudio = false) {
     return navigator.mediaDevices.getDisplayMedia({
         video: { frameRate: 1, width: { ideal: 1920 }, height: { ideal: 1080 } },
         audio: withAudio ? { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } : false,
+    });
+}
+async function readDefaultMic() {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const mic = devices.find(device => device.kind === 'audioinput' && device.deviceId === 'default');
+    return mic?.groupId || mic?.label || null;
+}
+
+async function rememberDefaultMic() {
+    const epoch = captureEpoch;
+    const mic = await readDefaultMic().catch(() => null);
+    if (epoch === captureEpoch) defaultMic = mic;
+}
+
+navigator.mediaDevices?.addEventListener?.('devicechange', async () => {
+    if (!captureActive || !defaultMic) return;
+    const epoch = captureEpoch;
+    const mic = await readDefaultMic().catch(() => null);
+    if (epoch !== captureEpoch || !mic || mic === defaultMic) return;
+    const input = audioInputs.find(({ source }) => source === 'mic');
+    if (!input) return;
+    defaultMic = mic;
+    input.needsReplacement = true;
+    audioRecovery = 'Default microphone changed. Select Retry audio to use it.';
+    if (!audioPaused) await pauseCapture();
+    else await reportCapture(false);
+});
+
+function openMicrophone(deviceId = preferencesCache.audioDeviceId) {
+    return navigator.mediaDevices.getUserMedia({
+        audio: {
+            sampleRate: SAMPLE_RATE,
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+        },
+        video: false,
     });
 }
 async function startCapture(_interval = 5, imageQuality = 'medium') {
@@ -268,17 +320,7 @@ async function startCapture(_interval = 5, imageQuality = 'medium') {
         if (epoch !== captureEpoch) return false;
         if (mode === 'mic_only' || mode === 'both') {
             captureTarget = 'microphone';
-            const stream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    sampleRate: SAMPLE_RATE,
-                    channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                    ...(preferencesCache.audioDeviceId ? { deviceId: { exact: preferencesCache.audioDeviceId } } : {}),
-                },
-                video: false,
-            });
+            const stream = await openMicrophone();
             if (epoch !== captureEpoch) {
                 stream.getTracks().forEach(t => t.stop());
                 return false;
@@ -286,7 +328,7 @@ async function startCapture(_interval = 5, imageQuality = 'medium') {
             await addAudioInput(stream, 'mic', config.audioChunkMs || 100);
         }
         if (epoch !== captureEpoch) return false;
-        await ipcRenderer.invoke('capture:state', { active: true });
+        await reportCapture(true);
         await ipcRenderer.invoke('performance:audio', { audioCaptureInitMs: performance.now() - started });
         cheatingDaddy.setStatus('Capturing audio — Stop Session to end');
         return true;
@@ -532,7 +574,7 @@ async function pauseCapture() {
     if (epoch !== captureEpoch) return false;
     if (nativeAudio) await ipcRenderer.invoke('stop-macos-audio');
     if (epoch !== captureEpoch) return false;
-    await ipcRenderer.invoke('capture:state', { active: false });
+    await reportCapture(false);
     await ipcRenderer.invoke('pause-audio').catch(error => console.warn('Could not notify the audio provider of pause:', error));
     if (epoch !== captureEpoch) return false;
     cheatingDaddy.setStatus('Audio paused');
@@ -540,26 +582,56 @@ async function pauseCapture() {
 }
 
 async function resumeCapture() {
-    if (!captureActive || !audioPaused) return false;
+    if (!captureActive || !audioPaused || suspended) return false;
     const epoch = captureEpoch;
+    const needsReplacement = input => input.needsReplacement || input.stream.getTracks().some(track => track.readyState === 'ended');
+    if (!audioRecovery && audioInputs.some(needsReplacement)) {
+        audioRecovery = 'Audio sharing ended. Select Retry audio to share again.';
+        await reportCapture(false);
+        return false;
+    }
     try {
-        for (const { stream, source, chunkMs } of audioInputs) {
-            const tracks = stream.getAudioTracks();
-            if (!tracks.length || tracks.some(track => track.readyState !== 'live')) {
-                throw new Error('Audio sharing ended. Stop this session and start a new one to share audio again.');
+        for (const input of audioInputs.filter(needsReplacement)) {
+            let stream;
+            if (input.source === 'system') {
+                stream = await authorizeScreen(true);
+            } else {
+                try {
+                    stream = await openMicrophone();
+                } catch (error) {
+                    if (epoch !== captureEpoch || error.name !== 'OverconstrainedError') throw error;
+                    stream = await openMicrophone('');
+                }
             }
-            tracks.forEach(track => (track.enabled = true));
+            if (epoch !== captureEpoch || suspended || !stream.getAudioTracks().length) {
+                stream.getTracks().forEach(track => track.stop());
+                if (epoch !== captureEpoch) return false;
+                throw new Error('Audio stream unavailable');
+            }
+            input.stream.getTracks().forEach(track => track.stop());
+            if (input.source === 'system') {
+                clearScreenPreview();
+                mediaStream = stream;
+            }
+            input.stream = stream;
+            input.needsReplacement = false;
+        }
+        for (const { stream, source, chunkMs } of audioInputs) {
+            stream.getAudioTracks().forEach(track => (track.enabled = true));
             await audioSession.add(stream, source, chunkMs);
             if (epoch !== captureEpoch) return false;
+            if (suspended) throw new Error('System suspended');
         }
         if (nativeAudio) {
             const result = await ipcRenderer.invoke('start-macos-audio');
             if (epoch !== captureEpoch) return false;
             if (!result.success) throw new Error(result.error || 'Could not restart system audio');
         }
-        await ipcRenderer.invoke('capture:state', { active: true });
-        if (epoch !== captureEpoch) return false;
         audioPaused = false;
+        pausedForSleep = false;
+        audioRecovery = '';
+        await reportCapture(true);
+        if (epoch !== captureEpoch) return false;
         cheatingDaddy.setStatus('Capturing audio — Stop Session to end');
         return true;
     } catch (error) {
@@ -569,27 +641,14 @@ async function resumeCapture() {
         }
         await audioSession.stop({ keepStreams: true });
         if (epoch !== captureEpoch) return false;
-        cheatingDaddy.setStatus('Could not resume audio: ' + error.message);
+        audioPaused = true;
+        audioRecovery = 'Audio could not resume. Check your device, then retry audio.';
+        await reportCapture(false);
         return false;
     }
 }
 
-async function stopCapture() {
-    captureEpoch++;
-    captureActive = false;
-    audioPaused = false;
-    nativeAudio = false;
-    for (const { stream } of audioInputs) {
-        stream.getTracks().forEach(track => track.stop());
-    }
-    audioInputs = [];
-    ipcRenderer.invoke('capture:state', { active: false }).catch(() => {});
-    const stoppingAudio = audioSession.stop();
-    const stoppingVoice = voiceOutput.stop();
-    if (screenshotInterval) clearInterval(screenshotInterval);
-    screenshotInterval = null;
-    if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
-    mediaStream = null;
+function clearScreenPreview() {
     if (hiddenVideo) {
         hiddenVideo.pause();
         hiddenVideo.srcObject = null;
@@ -597,9 +656,43 @@ async function stopCapture() {
     }
     offscreenCanvas = null;
     offscreenContext = null;
+}
+
+async function stopCapture() {
+    captureEpoch++;
+    captureActive = false;
+    audioPaused = false;
+    nativeAudio = false;
+    audioRecovery = '';
+    pausedForSleep = false;
+    defaultMic = null;
+    for (const { stream } of audioInputs) {
+        stream.getTracks().forEach(track => track.stop());
+    }
+    audioInputs = [];
+    reportCapture(false).catch(() => {});
+    const stoppingAudio = audioSession.stop();
+    const stoppingVoice = voiceOutput.stop();
+    if (screenshotInterval) clearInterval(screenshotInterval);
+    screenshotInterval = null;
+    if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+    mediaStream = null;
+    clearScreenPreview();
     await Promise.all([stoppingAudio, stoppingVoice]);
     if (isMacOS) await ipcRenderer.invoke('stop-macos-audio');
 }
+ipcRenderer.on('native-audio-interrupted', () => {
+    if (!captureActive || !nativeAudio || audioPaused) return;
+    audioRecovery = 'System audio stopped. Select Retry audio to restart it.';
+    pauseCapture().catch(console.warn);
+});
+ipcRenderer.on('capture-power', (_event, sleeping) => {
+    suspended = sleeping;
+    if (sleeping && !audioPaused && captureActive && (audioInputs.length || nativeAudio)) {
+        pausedForSleep = true;
+        return pauseCapture().catch(console.warn);
+    }
+});
 ipcRenderer.on('capture-stopped', () => {
     stopCapture();
 });

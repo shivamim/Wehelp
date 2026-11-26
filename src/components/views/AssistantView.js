@@ -232,6 +232,18 @@ export class AssistantView extends LitElement {
 
         /* ── Bottom input bar ── */
 
+        .session-notice {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: var(--space-sm);
+            padding: var(--space-xs) var(--space-md);
+            border-top: 1px solid var(--border);
+            background: var(--bg-app);
+            color: var(--text-primary);
+            font-size: var(--font-size-xs);
+        }
+
         .input-bar {
             display: flex;
             align-items: center;
@@ -328,6 +340,7 @@ export class AssistantView extends LitElement {
 
     static properties = {
         responses: { type: Array },
+        providerHealth: { attribute: false },
         currentResponseIndex: { type: Number },
         selectedProfile: { type: String },
         onSendText: { type: Function },
@@ -472,9 +485,9 @@ export class AssistantView extends LitElement {
         this.requestUpdate();
         try {
             if (this._capturePaused) {
-                if (await cheatingDaddy.resumeCapture()) this._capturePaused = false;
+                await cheatingDaddy.resumeCapture();
             } else {
-                this._capturePaused = await cheatingDaddy.pauseCapture();
+                await cheatingDaddy.pauseCapture();
             }
         } finally {
             this._captureChanging = false;
@@ -506,6 +519,9 @@ export class AssistantView extends LitElement {
 
             this.handleCaptureState = (_event, state) => {
                 this._audioActive = state.active;
+                this._capturePaused = state.paused;
+                this._audioRecovery = state.recovery;
+                this._pausedForSleep = state.pausedForSleep;
                 this.requestUpdate();
             };
             ipcRenderer.on('capture-state', this.handleCaptureState);
@@ -844,7 +860,23 @@ export class AssistantView extends LitElement {
                       `
                     : ''
             }
-
+            ${
+                this.providerHealth?.message
+                    ? html`<div class="session-notice" role="status">
+                          ${this.providerHealth.message}
+                          ${
+                              this.providerHealth.state === 'disconnected'
+                                  ? html`<button class="analyze-btn" @click=${() => ipcRenderer.invoke('retry-provider')}>Reconnect</button>`
+                                  : ''
+                          }
+                      </div>`
+                    : ''
+            }
+            ${
+                this._audioRecovery || this._pausedForSleep
+                    ? html`<div class="session-notice" role="status">${this._audioRecovery || 'Audio paused for sleep. Resume when ready.'}</div>`
+                    : ''
+            }
             <div class="input-bar">
                 <div class="input-bar-inner">
                     <input type="text" id="textInput" placeholder="Type a message..." @keydown=${this.handleTextKeydown} />
@@ -855,9 +887,9 @@ export class AssistantView extends LitElement {
                     ?disabled=${this._captureChanging || (!this._audioActive && !this._capturePaused)}
                     @click=${this.toggleAudioCapture}
                 >
-                    ${this._capturePaused ? 'Resume audio' : 'Pause audio'}
+                    ${this._audioRecovery ? 'Retry audio' : this._capturePaused ? 'Resume audio' : 'Pause audio'}
                 </button>
-                <span role="status">${this._audioActive ? 'Audio capture active' : this._capturePaused ? 'Audio paused' : 'No audio capture'}</span>
+                <span role="status"> ${this._audioActive ? 'Audio capture active' : this._capturePaused ? 'Audio paused' : 'No audio capture'} </span>
                 <button class="analyze-btn ${this.isAnalyzing ? 'analyzing' : ''}" @click=${this.handleScreenAnswer}>
                     <canvas class="analyze-canvas"></canvas>
                     <span class="analyze-btn-content">

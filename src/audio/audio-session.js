@@ -63,7 +63,7 @@ export class AudioSession {
         }
     }
     fail(error) {
-        this.stop();
+        this.stop({ keepStreams: true });
         this.onError(error);
     }
     async stop({ keepStreams = false } = {}) {
