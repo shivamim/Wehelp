@@ -74,7 +74,7 @@ app.on('browser-window-created', (_event, win) => {
                         if (condition()) return;
                         await new Promise(resolve => setTimeout(resolve, 20));
                     }
-                    throw new Error('Quick Answer controls did not finish');
+                    throw new Error('Quick Answer controls did not finish: ' + view.quickAnswerStatus + ' | ' + app.statusText + ' | ' + JSON.stringify(app.responses));
                 };
                 await waitFor(() => app.quickAnswerPin === 'Use degrees.');
                 const quick = await window.wehelp.operations['send-text-message']('What is the angle at 3:15?');
