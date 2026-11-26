@@ -13,6 +13,17 @@ app.on('browser-window-created', (_event, win) => {
     });
     win.webContents.on('did-finish-load', async () => {
         try {
+            const { generation } = require('../src/utils/gemini');
+            generation.getKeys = () => ({ groq: 'smoke-fixture' });
+            generation.adapters = {
+                groq: {
+                    async *chat({ messages }) {
+                        if (!messages[0].content.includes('Use degrees.')) throw new Error('Pinned session context was missing');
+                        yield messages[0].content.includes('Explain thoroughly') ? 'The hour hand moves 0.5° per minute.' : '7.5°. ';
+                    },
+                },
+            };
+            generation.start();
             const result = await win.webContents.executeJavaScript(`(async () => {
                 await customElements.whenDefined('cheating-daddy-app');
                 const app = document.querySelector('cheating-daddy-app');
@@ -46,8 +57,32 @@ app.on('browser-window-created', (_event, win) => {
                 if (!engine.shadowRoot.textContent.includes('Performance')) throw new Error('Missing dashboard');
                 const models = await window.wehelp.operations['models:list']();
                 if (!models.length) throw new Error('No model registry');
+                for (const [key, value] of [['responseStyle', 'quick'], ['responseProvider', 'groq']]) {
+                    const saved = await window.wehelp.operations['storage:update-config'](key, value);
+                    if (!saved.success) throw new Error('Quick Answer settings did not save');
+                }
+                app.quickAnswerEnabled = true;
                 app.currentView = 'assistant'; await app.updateComplete;
                 const view = app.shadowRoot.querySelector('assistant-view'); await view.updateComplete;
+                const form = view.shadowRoot.querySelector('.quick-answer-context form');
+                form.querySelector('input').value = 'Use degrees.';
+                form.requestSubmit();
+                const waitFor = async condition => {
+                    for (let i = 0; i < 100; i++) {
+                        if (condition()) return;
+                        await new Promise(resolve => setTimeout(resolve, 20));
+                    }
+                    throw new Error('Quick Answer controls did not finish');
+                };
+                await waitFor(() => app.quickAnswerPin === 'Use degrees.');
+                const quick = await window.wehelp.operations['send-text-message']('What is the angle at 3:15?');
+                if (!quick.success) throw new Error(quick.error);
+                const deepenButton = () => Array.from(view.shadowRoot.querySelectorAll('button')).find(b => b.textContent.trim() === 'Go deeper');
+                await waitFor(deepenButton);
+                if (app.responses.at(-1).trim() !== '7.5°.') throw new Error('Quick Answer failed to render');
+                deepenButton().click();
+                await waitFor(() => app.responses.at(-1) === 'The hour hand moves 0.5° per minute.');
+
                 app.addNewResponse('# Answer\\n\\n<img src=x onerror="window.__unsafe=true"><script>window.__unsafe=true</script>');
                 await app.updateComplete; await view.updateComplete;
                 view._streamRenderer.finalize(app.responses.at(-1));
@@ -65,7 +100,7 @@ app.on('browser-window-created', (_event, win) => {
                 if (!chunks || !allTracksStopped || unsafeDOM) throw new Error('Worklet capture/cleanup or sanitized DOM failed');
                 app.currentView = 'main'; await app.updateComplete;
                 await window.wehelp.operations['close-session']();
-                return { isolation, modelCount: models.length, metrics: await window.wehelp.operations['performance:snapshot'](), unsafeExecuted: !!window.__unsafe, settings: !!engine, startupFailureVisible: true, workletChunks: chunks, allTracksStopped };
+                return { isolation, modelCount: models.length, metrics: await window.wehelp.operations['performance:snapshot'](), unsafeExecuted: !!window.__unsafe, settings: !!engine, startupFailureVisible: true, quickAnswer: true, workletChunks: chunks, allTracksStopped };
             })()`);
             if (
                 result.isolation.require !== 'undefined' ||

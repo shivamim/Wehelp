@@ -24,6 +24,8 @@ for (const channel of [
     'performance:rendered',
     'performance:snapshot',
     'quit-application',
+    'quick-answer:pin',
+    'quick-answer:deepen',
     'send-audio-content',
     'send-image-content',
     'send-mic-audio-content',

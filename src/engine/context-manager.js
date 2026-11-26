@@ -4,10 +4,15 @@ const estimateTokens = content =>
     Array.isArray(content)
         ? content.reduce((sum, part) => sum + (part.type === 'text' ? estimateTokens(part.text) : 4096), 0)
         : Math.ceil(Buffer.byteLength(typeof content === 'string' ? content : JSON.stringify(content), 'utf8') / 3);
-function prepareContext(system, history, input, { budget = 12000, outputTokens = 1024, style = 'standard' } = {}) {
+function prepareContext(system, history, input, { budget = 12000, outputTokens = 1024, style = 'standard', pinnedContext = '' } = {}) {
     const instruction =
-        { concise: 'Keep the answer concise and directly useful.', standard: '', detailed: 'Explain thoroughly, with useful examples.' }[style] || '';
-    const prompt = `${system || 'You are a helpful assistant.'}${instruction ? '\nResponse style: ' + instruction : ''}`;
+        {
+            concise: 'Keep the answer concise and directly useful.',
+            standard: '',
+            detailed: 'Explain thoroughly, with useful examples.',
+            quick: 'Put the direct answer in the first sentence. For coding questions, state the approach first, then give the requested code and complexity. Skip preambles and restating the question. Follow with only the reasoning needed to use or verify the answer. If an ambiguity changes the answer, state the assumption briefly. Do not invent missing facts.',
+        }[style] || '';
+    const prompt = `${system || 'You are a helpful assistant.'}${instruction ? '\nResponse style: ' + instruction : ''}${pinnedContext ? '\nUser-pinned session context (apply where relevant):\n' + pinnedContext : ''}`;
     let remaining = budget - outputTokens - estimateTokens(prompt) - estimateTokens(input);
     if (remaining < 0) throw new Error('Current input and instructions exceed the selected context budget');
     const selected = [];

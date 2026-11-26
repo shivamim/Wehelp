@@ -244,6 +244,35 @@ export class AssistantView extends LitElement {
             font-size: var(--font-size-xs);
         }
 
+        .quick-answer-context {
+            flex: 1;
+        }
+
+        .quick-answer-context form {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: end;
+            gap: var(--space-sm);
+            padding-top: var(--space-sm);
+        }
+
+        .quick-answer-context label {
+            display: grid;
+            flex: 1;
+            gap: var(--space-xs);
+        }
+
+        .quick-answer-context input {
+            min-width: 0;
+            min-height: 32px;
+            padding: 0 var(--space-sm);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background: var(--bg-elevated);
+            color: var(--text-primary);
+            font: inherit;
+        }
+
         .input-bar {
             display: flex;
             align-items: center;
@@ -341,6 +370,11 @@ export class AssistantView extends LitElement {
     static properties = {
         responses: { type: Array },
         providerHealth: { attribute: false },
+        quickAnswerEnabled: { type: Boolean },
+        quickAnswerPin: { type: String },
+        expandableAnswerId: { type: String },
+        quickAnswerStatus: { state: true },
+        quickAnswerBusy: { state: true },
         currentResponseIndex: { type: Number },
         selectedProfile: { type: String },
         onSendText: { type: Function },
@@ -476,6 +510,34 @@ export class AssistantView extends LitElement {
         if (container) {
             const scrollAmount = container.clientHeight * 0.3;
             container.scrollTop = Math.min(container.scrollHeight - container.clientHeight, container.scrollTop + scrollAmount);
+        }
+    }
+
+    async pinQuickAnswerContext(event) {
+        event.preventDefault();
+        this.quickAnswerStatus = '';
+        const value = new FormData(event.currentTarget).get('context').trim();
+        try {
+            const result = await ipcRenderer.invoke('quick-answer:pin', value);
+            if (!result.success) throw new Error(result.error);
+            this.dispatchEvent(new CustomEvent('quick-answer-pinned', { detail: value }));
+            this.quickAnswerStatus = value ? 'Context pinned for this session.' : 'Pinned context cleared.';
+        } catch (error) {
+            this.quickAnswerStatus = error.message;
+        }
+    }
+
+    async deepenQuickAnswer() {
+        if (this.quickAnswerBusy || !this.expandableAnswerId) return;
+        this.quickAnswerBusy = true;
+        this.quickAnswerStatus = '';
+        try {
+            const result = await ipcRenderer.invoke('quick-answer:deepen', this.expandableAnswerId);
+            if (!result.success && !result.cancelled) this.quickAnswerStatus = result.error;
+        } catch (error) {
+            this.quickAnswerStatus = error.message;
+        } finally {
+            this.quickAnswerBusy = false;
         }
     }
 
@@ -875,6 +937,35 @@ export class AssistantView extends LitElement {
             ${
                 this._audioRecovery || this._pausedForSleep
                     ? html`<div class="session-notice" role="status">${this._audioRecovery || 'Audio paused for sleep. Resume when ready.'}</div>`
+                    : ''
+            }
+            ${
+                this.quickAnswerEnabled
+                    ? html`<div class="session-notice">
+                          <details class="quick-answer-context">
+                              <summary>${this.quickAnswerPin ? 'Pinned context' : 'Pin session context'}</summary>
+                              <form @submit=${this.pinQuickAnswerContext}>
+                                  <label>
+                                      Context for the remaining answers in this session
+                                      <input
+                                          name="context"
+                                          maxlength="500"
+                                          .value=${this.quickAnswerPin || ''}
+                                          placeholder="Use Python and explain time complexity"
+                                      />
+                                  </label>
+                                  <button class="analyze-btn" type="submit">Save context</button>
+                              </form>
+                          </details>
+                          ${
+                              this.expandableAnswerId
+                                  ? html`<button class="analyze-btn" ?disabled=${this.quickAnswerBusy} @click=${this.deepenQuickAnswer}>
+                                        Go deeper
+                                    </button>`
+                                  : ''
+                          }
+                          <span role="status">${this.quickAnswerStatus || ''}</span>
+                      </div>`
                     : ''
             }
             <div class="input-bar">
