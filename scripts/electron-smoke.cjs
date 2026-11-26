@@ -23,6 +23,12 @@ app.on('browser-window-created', (_event, win) => {
                     },
                 },
             };
+            await win.webContents.executeJavaScript(`(async () => {
+                for (const [key, value] of [['responseStyle', 'quick'], ['responseProvider', 'groq']]) {
+                    const saved = await window.wehelp.operations['storage:update-config'](key, value);
+                    if (!saved.success) throw new Error('Quick Answer settings did not save');
+                }
+            })()`);
             generation.start();
             const result = await win.webContents.executeJavaScript(`(async () => {
                 await customElements.whenDefined('cheating-daddy-app');
@@ -57,10 +63,6 @@ app.on('browser-window-created', (_event, win) => {
                 if (!engine.shadowRoot.textContent.includes('Performance')) throw new Error('Missing dashboard');
                 const models = await window.wehelp.operations['models:list']();
                 if (!models.length) throw new Error('No model registry');
-                for (const [key, value] of [['responseStyle', 'quick'], ['responseProvider', 'groq']]) {
-                    const saved = await window.wehelp.operations['storage:update-config'](key, value);
-                    if (!saved.success) throw new Error('Quick Answer settings did not save');
-                }
                 app.quickAnswerEnabled = true;
                 app.currentView = 'assistant'; await app.updateComplete;
                 const view = app.shadowRoot.querySelector('assistant-view'); await view.updateComplete;
