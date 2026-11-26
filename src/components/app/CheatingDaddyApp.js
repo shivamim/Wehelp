@@ -371,6 +371,7 @@ export class CheatingDaddyApp extends LitElement {
     static properties = {
         currentView: { type: String },
         statusText: { type: String },
+        providerHealth: { state: true },
         startTime: { type: Number },
         isRecording: { type: Boolean },
         sessionActive: { type: Boolean },
@@ -471,13 +472,20 @@ export class CheatingDaddyApp extends LitElement {
                         next[stream.index] = stream.text;
                         this.responses = next;
                     }
-                    if (!stream.rendered && this.currentView === 'assistant' && this.currentResponseIndex === stream.index && !document.hidden) {
+                    if (
+                        !stream.rendered &&
+                        stream.text.trim() &&
+                        this.currentView === 'assistant' &&
+                        this.currentResponseIndex === stream.index &&
+                        !document.hidden
+                    ) {
                         stream.rendered = true;
                         this.updateComplete.then(() =>
                             requestAnimationFrame(() =>
                                 requestAnimationFrame(() => {
                                     if (this.currentView === 'assistant' && this.currentResponseIndex === stream.index && !document.hidden)
                                         ipcRenderer.invoke('performance:rendered', event.requestId);
+                                    else stream.rendered = false;
                                 })
                             )
                         );
@@ -504,7 +512,7 @@ export class CheatingDaddyApp extends LitElement {
             ipcRenderer.on('click-through-toggled', (_, isEnabled) => {
                 this._isClickThrough = isEnabled;
             });
-            ipcRenderer.on('reconnect-failed', (_, data) => this.addNewResponse(data.message));
+            ipcRenderer.on('provider-health', (_, health) => (this.providerHealth = health));
             ipcRenderer.on('whisper-downloading', (_, downloading) => {
                 this._whisperDownloading = downloading;
             });
@@ -523,7 +531,7 @@ export class CheatingDaddyApp extends LitElement {
             ipcRenderer.removeAllListeners('update-response');
             ipcRenderer.removeAllListeners('update-status');
             ipcRenderer.removeAllListeners('click-through-toggled');
-            ipcRenderer.removeAllListeners('reconnect-failed');
+            ipcRenderer.removeAllListeners('provider-health');
             ipcRenderer.removeAllListeners('whisper-downloading');
             ipcRenderer.removeAllListeners('local-ai-download-progress');
         }
@@ -835,6 +843,7 @@ export class CheatingDaddyApp extends LitElement {
             case 'assistant':
                 return html`
                     <assistant-view
+                        .providerHealth=${this.providerHealth}
                         .responses=${this.responses}
                         .currentResponseIndex=${this.currentResponseIndex}
                         .selectedProfile=${this.selectedProfile}

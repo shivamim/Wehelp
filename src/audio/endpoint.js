@@ -11,8 +11,9 @@ class Endpoint {
         this.pre = [];
         this.silence = 0;
         this.duration = 0;
+        this.lastVoiceAt = undefined;
     }
-    push(pcm) {
+    push(pcm, receivedAt) {
         let energy = 0;
         for (let i = 0; i < pcm.length; i += 2) energy += (pcm.readInt16LE(i) / 32768) ** 2;
         const voice = Math.sqrt(energy / (pcm.length / 2)) >= this.threshold;
@@ -26,13 +27,15 @@ class Endpoint {
             this.pre = [];
             this.onStart();
         } else this.buffers.push(Buffer.from(pcm));
+        if (voice) this.lastVoiceAt = receivedAt;
         this.duration += duration;
         this.silence = voice ? 0 : this.silence + duration;
         if (this.silence >= this.silenceMs || this.duration >= 30000) {
             const result = Buffer.concat(this.buffers);
+            const speechEnd = this.lastVoiceAt;
             const voicedDuration = this.duration - this.silence;
             this.reset();
-            if (voicedDuration >= 200) this.onEnd(result);
+            if (voicedDuration >= 200) this.onEnd(result, speechEnd);
         }
     }
 }

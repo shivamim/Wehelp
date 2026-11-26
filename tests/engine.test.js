@@ -267,3 +267,46 @@ test('model discovery from a rotated credential cannot overwrite the new account
     assert.equal(registry.get('groq', 'openai/gpt-oss-20b', 'text').availability, 'available');
     assert.throws(() => registry.get('groq', 'llama-3.1-8b-instant', 'text'));
 });
+
+test('speech latency includes endpoint silence and separates transcription from rendering', () => {
+    let now = 0;
+    const metrics = new PerformanceMonitor({ now: () => now });
+    const silence = Buffer.alloc(4800);
+    const voice = Buffer.alloc(4800);
+    for (let i = 0; i < voice.length; i += 2) voice.writeInt16LE(2000, i);
+    let sample;
+    const endpoint = new Endpoint({
+        silenceMs: 400,
+        onEnd: (_pcm, speechEnd) => {
+            const endpointAt = now;
+            now += 250;
+            sample = metrics.start('groq', 'model', 'text', speechEnd);
+            sample.endpointAt = endpointAt;
+        },
+    });
+    for (const pcm of [voice, voice, silence, silence, silence, silence]) {
+        now += 100;
+        endpoint.push(pcm, now);
+    }
+    now += 150;
+    metrics.mark(sample.requestId, 'firstRendered');
+    metrics.finish(sample.requestId, 'COMPLETED');
+    const summary = metrics.snapshot();
+    assert.equal(summary.lastEndpointMs, 400);
+    assert.equal(summary.lastTranscriptionMs, 250);
+    assert.equal(summary.lastSpeechToVisibleMs, 800);
+    assert.equal(summary.speechToVisibleP95Ms, 800);
+});
+
+test('Instant auto routing prefers a consistently faster observed model within the chosen provider', () => {
+    const registry = new ModelRegistry();
+    const preferred = registry.get('groq', 'llama-3.1-8b-instant', 'text');
+    const alternative = registry.get('groq', 'openai/gpt-oss-120b', 'text');
+    Object.assign(preferred, { availability: 'available', observedLatencyMs: 900, latencySamples: 3 });
+    Object.assign(alternative, { availability: 'available', observedLatencyMs: 350, latencySamples: 2 });
+    const config = { performanceMode: 'instant', responseProvider: 'groq' };
+    assert.equal(route(registry, config, { groq: 'fixture' }).model.id, preferred.id);
+    alternative.latencySamples++;
+    assert.equal(route(registry, config, { groq: 'fixture' }).model.id, alternative.id);
+    assert.equal(route(registry, { ...config, groqModel: preferred.id }, { groq: 'fixture' }).model.id, preferred.id);
+});

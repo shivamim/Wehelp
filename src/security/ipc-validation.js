@@ -60,7 +60,17 @@ function validate(channel, args) {
         const url = new URL(args[0]);
         if (url.protocol !== 'https:' || url.username || url.password) throw new Error('Only HTTPS links may be opened');
     }
-    if (channel === 'capture:state' && (!object(args[0]) || typeof args[0].active !== 'boolean')) throw new Error('Invalid capture state');
+    if (channel === 'capture:state') {
+        const state = args[0];
+        if (
+            !object(state) ||
+            typeof state.active !== 'boolean' ||
+            (state.paused !== undefined && typeof state.paused !== 'boolean') ||
+            (state.pausedForSleep !== undefined && typeof state.pausedForSleep !== 'boolean') ||
+            (state.recovery !== undefined && !text(state.recovery, 200))
+        )
+            throw new Error('Invalid capture state');
+    }
     if (channel === 'audio:chunk') {
         const chunk = args[0];
         if (

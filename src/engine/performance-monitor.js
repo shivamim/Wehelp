@@ -41,6 +41,9 @@ class PerformanceMonitor {
             .map(r => r.firstRendered - r.start)
             .sort((a, b) => a - b);
         const percentile = p => (values.length ? values[Math.min(values.length - 1, Math.ceil(p * values.length) - 1)] : null);
+        const speech = this.samples.filter(r => Number.isFinite(r.speechEnd) && r.firstRendered !== undefined);
+        const speechValues = speech.map(r => r.firstRendered - r.speechEnd).sort((a, b) => a - b);
+        const latestSpeech = speech.at(-1);
         const last = this.samples.at(-1) || [...this.requests.values()].at(-1);
         const elapsed = this.now() - (this.cpuTime || this.boot);
         const cpu = this.cpuAt ? process.cpuUsage(this.cpuAt) : null;
@@ -52,6 +55,11 @@ class PerformanceMonitor {
             model: last?.model || null,
             requests: this.requests.size,
             lastLatencyMs: last?.firstRendered === undefined ? null : last.firstRendered - last.start,
+            speechSamples: speech.length,
+            lastSpeechToVisibleMs: latestSpeech ? latestSpeech.firstRendered - latestSpeech.speechEnd : null,
+            speechToVisibleP95Ms: speech.length ? speechValues[Math.ceil(speech.length * 0.95) - 1] : null,
+            lastEndpointMs: latestSpeech?.endpointAt === undefined ? null : latestSpeech.endpointAt - latestSpeech.speechEnd,
+            lastTranscriptionMs: latestSpeech?.endpointAt === undefined ? null : latestSpeech.start - latestSpeech.endpointAt,
             averageMs: values.length ? values.reduce((a, b) => a + b, 0) / values.length : null,
             p50Ms: percentile(0.5),
             p95Ms: percentile(0.95),
@@ -64,7 +72,7 @@ class PerformanceMonitor {
             cpuPercent: cpu && elapsed > 0 ? (cpu.user + cpu.system) / (elapsed * 10) : null,
             eventLoopP95Ms: this.loop ? this.loop.percentile(95) / 1e6 : null,
             samples: this.samples.map(
-                ({ requestId, provider, model, type, status, start, headers, firstToken, firstRendered, end, speechEnd, chars }) => ({
+                ({ requestId, provider, model, type, status, start, headers, firstToken, firstRendered, end, speechEnd, endpointAt, chars }) => ({
                     requestId,
                     provider,
                     model,
@@ -75,6 +83,8 @@ class PerformanceMonitor {
                     firstTokenMs: firstToken === undefined ? null : firstToken - start,
                     firstRenderedMs: firstRendered === undefined ? null : firstRendered - start,
                     speechToVisibleMs: speechEnd === undefined || firstRendered === undefined ? null : firstRendered - speechEnd,
+                    endpointMs: endpointAt === undefined || speechEnd === undefined ? null : endpointAt - speechEnd,
+                    transcriptionMs: endpointAt === undefined ? null : start - endpointAt,
                     totalMs: end === undefined ? null : end - start,
                 })
             ),
@@ -93,6 +103,8 @@ class PerformanceMonitor {
             'firstTokenMs',
             'firstRenderedMs',
             'speechToVisibleMs',
+            'endpointMs',
+            'transcriptionMs',
             'totalMs',
             'chars',
         ];

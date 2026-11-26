@@ -20,7 +20,7 @@ function setOnTurnComplete(callback) {
     onTurnComplete = callback;
 }
 
-function connectCloud(token, profile, userContext) {
+function connectCloud(token, profile, userContext, onDisconnect) {
     // Close existing connection
     if (cloudWs) {
         try {
@@ -31,59 +31,52 @@ function connectCloud(token, profile, userContext) {
     }
 
     audioChunkCount = 0;
+    currentCloudResponse = currentTranscription = '';
+    isFirstChunk = true;
 
     return new Promise((resolve, reject) => {
         const url = `wss://api.cheatingdaddy.com/ws?token=${encodeURIComponent(token)}`;
         console.log('[Cloud] Connecting');
 
-        cloudWs = new WebSocket(url);
-
+        const socket = (cloudWs = new WebSocket(url));
+        let opened = false;
         const timeout = setTimeout(() => {
-            if (!isCloudConnected) {
-                cloudWs.close();
-                reject(new Error('Cloud connection timeout'));
-            }
+            socket.close();
+            reject(new Error('Cloud connection timeout'));
         }, 10000);
 
-        cloudWs.on('open', () => {
-            console.log('[Cloud] WebSocket open');
+        socket.on('open', () => {
+            if (socket !== cloudWs) return;
+            opened = true;
             isCloudConnected = true;
             clearTimeout(timeout);
-
-            // Send config immediately after open
-            const config = JSON.stringify({
-                type: 'set_config',
-                profile: profile || 'interview',
-                user_context: userContext || '',
-            });
-            cloudWs.send(config);
-            console.log('[Cloud] Config sent:', profile);
-
+            socket.send(JSON.stringify({ type: 'set_config', profile: profile || 'interview', user_context: userContext || '' }));
             sendToRenderer('update-status', 'Cloud connected');
             resolve(true);
         });
 
-        cloudWs.on('message', data => {
+        socket.on('message', data => {
+            if (socket !== cloudWs) return;
             try {
-                const msg = JSON.parse(data.toString());
-                handleMessage(msg);
-            } catch (e) {
-                console.error('[Cloud] Parse error:', e);
+                const message = JSON.parse(data.toString());
+                handleMessage(message);
+                if (message.type === 'session_end') socket.close();
+            } catch (error) {
+                console.error('[Cloud] Parse error:', error.message);
             }
         });
 
-        cloudWs.on('close', (code, reason) => {
-            console.log('[Cloud] WebSocket closed:', code, reason.toString());
-            console.log('[Cloud] Audio chunks sent before close:', audioChunkCount);
-            isCloudConnected = false;
+        socket.on('close', () => {
             clearTimeout(timeout);
+            if (!opened) reject(new Error('Cloud connection closed'));
+            if (socket !== cloudWs) return;
+            isCloudConnected = false;
+            if (opened) onDisconnect?.();
         });
 
-        cloudWs.on('error', err => {
-            console.error('[Cloud] WebSocket error:', err.message);
-            isCloudConnected = false;
-            clearTimeout(timeout);
-            reject(err);
+        socket.on('error', error => {
+            if (!opened) reject(error);
+            socket.close();
         });
     });
 }
