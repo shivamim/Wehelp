@@ -372,6 +372,9 @@ export class CheatingDaddyApp extends LitElement {
         currentView: { type: String },
         statusText: { type: String },
         providerHealth: { state: true },
+        quickAnswerEnabled: { state: true },
+        quickAnswerPin: { state: true },
+        expandableAnswer: { state: true },
         startTime: { type: Number },
         isRecording: { type: Boolean },
         sessionActive: { type: Boolean },
@@ -452,9 +455,24 @@ export class CheatingDaddyApp extends LitElement {
 
         if (window.wehelp) {
             this._streams = new Map();
+            const markVisible = (stream, requestId, opening) => {
+                const flag = opening ? 'openingRendered' : 'rendered';
+                if (stream[flag] || this.currentView !== 'assistant' || this.currentResponseIndex !== stream.index || document.hidden) return;
+                stream[flag] = true;
+                this.updateComplete.then(() =>
+                    requestAnimationFrame(() =>
+                        requestAnimationFrame(() => {
+                            if (this.currentView === 'assistant' && this.currentResponseIndex === stream.index && !document.hidden)
+                                ipcRenderer.invoke('performance:rendered', requestId, opening);
+                            else stream[flag] = false;
+                        })
+                    )
+                );
+            };
             ipcRenderer.on('response-stream', (_event, event) => {
                 if (event.type === 'start') {
                     this._streams.clear();
+                    this.expandableAnswer = null;
                     this._streams.set(event.requestId, { sequence: event.sequence, text: '', index: null, rendered: false });
                     this.setStatus('Generating response...');
                     return;
@@ -472,25 +490,16 @@ export class CheatingDaddyApp extends LitElement {
                         next[stream.index] = stream.text;
                         this.responses = next;
                     }
-                    if (
-                        !stream.rendered &&
-                        stream.text.trim() &&
-                        this.currentView === 'assistant' &&
-                        this.currentResponseIndex === stream.index &&
-                        !document.hidden
-                    ) {
-                        stream.rendered = true;
-                        this.updateComplete.then(() =>
-                            requestAnimationFrame(() =>
-                                requestAnimationFrame(() => {
-                                    if (this.currentView === 'assistant' && this.currentResponseIndex === stream.index && !document.hidden)
-                                        ipcRenderer.invoke('performance:rendered', event.requestId);
-                                    else stream.rendered = false;
-                                })
-                            )
-                        );
+                    if (stream.text.trim()) {
+                        markVisible(stream, event.requestId, false);
+                        // This estimates sentence completion from streaming text. A decimal point alone is never a boundary.
+                        if (/[.!?][*_"`)]*\s|[。！？]/u.test(stream.text.slice(0, 1500))) markVisible(stream, event.requestId, true);
                     }
                 } else {
+                    if (event.type === 'complete' && stream.text.trim()) {
+                        markVisible(stream, event.requestId, true);
+                        if (event.expandable) this.expandableAnswer = { id: event.requestId, index: stream.index };
+                    }
                     this.setStatus(
                         event.type === 'error' ? 'Error: ' + event.message : event.type === 'cancelled' ? 'Request cancelled' : 'Listening...'
                     );
@@ -640,6 +649,9 @@ export class CheatingDaddyApp extends LitElement {
         this.requestUpdate();
         try {
             const prefs = await cheatingDaddy.storage.getPreferences();
+            this.quickAnswerEnabled = false;
+            this.quickAnswerPin = '';
+            this.expandableAnswer = null;
             const providerMode = prefs.providerMode === 'cloud' ? 'byok' : prefs.providerMode || 'byok';
 
             if (providerMode === 'cloud') {
@@ -682,6 +694,7 @@ export class CheatingDaddyApp extends LitElement {
                 }
 
                 if (!(await cheatingDaddy.initializeGemini(this.selectedProfile, this.selectedLanguage))) return;
+                this.quickAnswerEnabled = runtime.responseStyle === 'quick' && runtime.performanceMode !== 'live-voice';
             }
 
             if (!(await cheatingDaddy.startCapture(this.selectedScreenshotInterval, this.selectedImageQuality))) return;
@@ -844,6 +857,10 @@ export class CheatingDaddyApp extends LitElement {
                 return html`
                     <assistant-view
                         .providerHealth=${this.providerHealth}
+                        .quickAnswerEnabled=${this.quickAnswerEnabled}
+                        .quickAnswerPin=${this.quickAnswerPin}
+                        .expandableAnswerId=${this.expandableAnswer?.index === this.currentResponseIndex ? this.expandableAnswer?.id : null}
+                        @quick-answer-pinned=${event => (this.quickAnswerPin = event.detail)}
                         .responses=${this.responses}
                         .currentResponseIndex=${this.currentResponseIndex}
                         .selectedProfile=${this.selectedProfile}

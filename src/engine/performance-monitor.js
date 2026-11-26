@@ -44,6 +44,13 @@ class PerformanceMonitor {
         const speech = this.samples.filter(r => Number.isFinite(r.speechEnd) && r.firstRendered !== undefined);
         const speechValues = speech.map(r => r.firstRendered - r.speechEnd).sort((a, b) => a - b);
         const latestSpeech = speech.at(-1);
+        const openingLatency = style => {
+            const values = this.samples
+                .filter(r => r.style === style && r.mode === 'instant' && Number.isFinite(r.speechEnd) && r.firstOpeningRendered !== undefined)
+                .map(r => r.firstOpeningRendered - r.speechEnd)
+                .sort((a, b) => a - b);
+            return { count: values.length, medianMs: values.length ? values[Math.ceil(values.length / 2) - 1] : null };
+        };
         const last = this.samples.at(-1) || [...this.requests.values()].at(-1);
         const elapsed = this.now() - (this.cpuTime || this.boot);
         const cpu = this.cpuAt ? process.cpuUsage(this.cpuAt) : null;
@@ -56,6 +63,8 @@ class PerformanceMonitor {
             requests: this.requests.size,
             lastLatencyMs: last?.firstRendered === undefined ? null : last.firstRendered - last.start,
             speechSamples: speech.length,
+            quickOpening: openingLatency('quick'),
+            instantOpening: openingLatency('standard'),
             lastSpeechToVisibleMs: latestSpeech ? latestSpeech.firstRendered - latestSpeech.speechEnd : null,
             speechToVisibleP95Ms: speech.length ? speechValues[Math.ceil(speech.length * 0.95) - 1] : null,
             lastEndpointMs: latestSpeech?.endpointAt === undefined ? null : latestSpeech.endpointAt - latestSpeech.speechEnd,
@@ -72,17 +81,38 @@ class PerformanceMonitor {
             cpuPercent: cpu && elapsed > 0 ? (cpu.user + cpu.system) / (elapsed * 10) : null,
             eventLoopP95Ms: this.loop ? this.loop.percentile(95) / 1e6 : null,
             samples: this.samples.map(
-                ({ requestId, provider, model, type, status, start, headers, firstToken, firstRendered, end, speechEnd, endpointAt, chars }) => ({
+                ({
                     requestId,
                     provider,
                     model,
                     type,
+                    style,
+                    mode,
+                    status,
+                    start,
+                    headers,
+                    firstToken,
+                    firstRendered,
+                    firstOpeningRendered,
+                    end,
+                    speechEnd,
+                    endpointAt,
+                    chars,
+                }) => ({
+                    requestId,
+                    provider,
+                    model,
+                    type,
+                    style,
+                    mode,
                     status,
                     chars,
                     headersMs: headers === undefined ? null : headers - start,
                     firstTokenMs: firstToken === undefined ? null : firstToken - start,
                     firstRenderedMs: firstRendered === undefined ? null : firstRendered - start,
                     speechToVisibleMs: speechEnd === undefined || firstRendered === undefined ? null : firstRendered - speechEnd,
+                    openingRenderedMs: firstOpeningRendered === undefined ? null : firstOpeningRendered - start,
+                    speechToOpeningMs: speechEnd === undefined || firstOpeningRendered === undefined ? null : firstOpeningRendered - speechEnd,
                     endpointMs: endpointAt === undefined || speechEnd === undefined ? null : endpointAt - speechEnd,
                     transcriptionMs: endpointAt === undefined ? null : start - endpointAt,
                     totalMs: end === undefined ? null : end - start,
@@ -98,11 +128,15 @@ class PerformanceMonitor {
             'provider',
             'model',
             'type',
+            'style',
+            'mode',
             'status',
             'headersMs',
             'firstTokenMs',
             'firstRenderedMs',
             'speechToVisibleMs',
+            'openingRenderedMs',
+            'speechToOpeningMs',
             'endpointMs',
             'transcriptionMs',
             'totalMs',

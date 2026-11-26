@@ -55,6 +55,11 @@ function validate(channel, args) {
     if (channel.startsWith('initialize-')) {
         for (const arg of args) if (arg !== undefined && !text(arg, 100000)) throw new Error('Invalid session configuration');
     }
+    if (channel === 'quick-answer:pin' && !text(args[0], 500)) throw new Error('Pinned context must be at most 500 characters');
+    if (channel === 'quick-answer:deepen' && (typeof args[0] !== 'string' || !/^[0-9a-f-]{36}$/.test(args[0])))
+        throw new Error('Invalid answer reference');
+    if (channel === 'performance:rendered' && (!text(args[0], 36) || (args[1] !== undefined && typeof args[1] !== 'boolean')))
+        throw new Error('Invalid render timing');
     if (channel === 'send-text-message' && (!text(args[0]) || !args[0].trim())) throw new Error('Invalid text input');
     if (channel === 'open-external') {
         const url = new URL(args[0]);
@@ -96,7 +101,7 @@ function validateConfig(config) {
         const choices = {
             performanceMode: ['instant', 'balanced', 'deep', 'live-voice', 'offline'],
             responseProvider: ['auto', 'gemini', 'groq', 'local'],
-            responseStyle: ['concise', 'standard', 'detailed'],
+            responseStyle: ['quick', 'concise', 'standard', 'detailed'],
             transcriptionProvider: ['gemini', 'groq'],
             audioChunkMs: [20, 40, 60, 100],
         };

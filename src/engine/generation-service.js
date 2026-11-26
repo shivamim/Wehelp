@@ -9,22 +9,45 @@ class GenerationService {
         Object.assign(this, { getConfig, getKeys, emit, save, metrics, adapters, registry });
         this.requests = new RequestManager(metrics);
         this.history = [];
+        this.pinnedContext = '';
+        this.expandableRequestId = null;
     }
     start(provider = 'byok') {
         this.history = [];
+        this.pinnedContext = '';
+        this.expandableRequestId = null;
         return this.requests.startSession(provider);
     }
     stop() {
         this.requests.stop();
         this.history = [];
+        this.pinnedContext = '';
+        this.expandableRequestId = null;
     }
-    async generate(text, { image, speechEnd, endpointAt } = {}) {
+    async deepen(requestId) {
+        if (
+            this.requests.active ||
+            !this.requests.sessionId ||
+            this.getConfig().responseStyle !== 'quick' ||
+            !requestId ||
+            requestId !== this.expandableRequestId
+        )
+            return { success: false, error: 'Go deeper is available for the latest completed Quick Answer.' };
+        return this.generate(
+            'Expand your preceding answer to my question. Add the missing reasoning, important edge cases, and a practical example when useful. Preserve the original constraints and correct any mistake you find.',
+            { deeper: true }
+        );
+    }
+    async generate(text, { image, speechEnd, endpointAt, deeper = false } = {}) {
         const config = this.getConfig(),
             keys = this.getKeys();
         let { provider, model, profile } = route(this.registry, config, keys, image ? 'vision' : 'text');
         if (provider === 'local') throw new Error('Start a Local AI session for Offline mode');
+        this.expandableRequestId = null;
         const request = this.requests.begin(provider, model.id, image ? 'vision' : 'text', speechEnd);
         request.endpointAt = endpointAt;
+        request.mode = config.performanceMode || 'balanced';
+        request.style = deeper ? 'detailed' : config.responseStyle || 'standard';
         const id = request.requestId;
         const event = (type, data = {}) =>
             this.emit('response-stream', { requestId: id, sessionId: request.sessionId, sequence: request.sequence++, type, ...data });
@@ -62,8 +85,10 @@ class GenerationService {
             const messages = prepareContext(config.systemPrompt, this.history, input, {
                 budget: Math.min(profile.contextTokens, model.contextLength),
                 outputTokens,
-                style: config.responseStyle,
+                style: request.style,
+                pinnedContext: config.responseStyle === 'quick' ? this.pinnedContext : '',
             });
+            if (deeper && messages.length < 4) throw new Error('The preceding answer is too long for this model’s context.');
             request.status = 'CONNECTING';
             event('start', { provider, model: model.id });
             for (let attempt = 0; ; attempt++) {
@@ -138,7 +163,9 @@ class GenerationService {
             this.history.push({ role: 'user', content: text }, { role: 'assistant', content: fullText });
             if (this.history.length > 100) this.history.splice(0, this.history.length - 100);
             this.save(text, fullText);
-            event('complete');
+            const expandable = request.style === 'quick' && !image;
+            this.expandableRequestId = expandable ? id : null;
+            event('complete', { expandable });
             this.emit('update-status', 'Listening...');
             this.requests.finish(request, 'COMPLETED');
             return { success: true, model: model.id };

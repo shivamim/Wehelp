@@ -310,3 +310,71 @@ test('Instant auto routing prefers a consistently faster observed model within t
     assert.equal(route(registry, config, { groq: 'fixture' }).model.id, alternative.id);
     assert.equal(route(registry, { ...config, groqModel: preferred.id }, { groq: 'fixture' }).model.id, preferred.id);
 });
+
+test('Quick Answer streams an answer-first request and expands the same turn with session context', async () => {
+    const seen = [];
+    const events = [];
+    const engine = new GenerationService({
+        getConfig: () => ({ responseStyle: 'quick', responseProvider: 'groq', performanceMode: 'instant' }),
+        getKeys: () => ({ groq: 'fixture' }),
+        metrics: new PerformanceMonitor(),
+        emit: (channel, event) => {
+            if (channel === 'response-stream') events.push(event);
+        },
+        save: () => {},
+        adapters: {
+            groq: {
+                async *chat({ messages }) {
+                    seen.push(messages);
+                    yield '7.5°. ';
+                    assert.equal(events.at(-1).type, 'delta');
+                    yield 'The hour hand moved one quarter of the distance between numbers.';
+                },
+            },
+        },
+    });
+    engine.start();
+    engine.pinnedContext = 'Use degrees.';
+    assert.ok((await engine.generate('What is the smaller angle at 3:15?')).success);
+    const quick = events.at(-1);
+    assert.equal(quick.expandable, true);
+    assert.match(seen[0][0].content, /direct answer in the first sentence/);
+    assert.match(seen[0][0].content, /Use degrees/);
+    assert.ok((await engine.deepen(quick.requestId)).success);
+    assert.match(seen[1][0].content, /Explain thoroughly/);
+    assert.match(seen[1][0].content, /Use degrees/);
+    assert.equal(seen[1][1].content, 'What is the smaller angle at 3:15?');
+    assert.match(seen[1][2].content, /7\.5°/);
+    assert.equal(events.at(-1).expandable, false);
+    assert.equal((await engine.deepen(quick.requestId)).success, false);
+    engine.start();
+    assert.equal(engine.pinnedContext, '');
+});
+
+test('opening sentence comparison includes only spoken Instant samples and keeps styles separate', () => {
+    let time = 10;
+    const metrics = new PerformanceMonitor({ now: () => time });
+    for (const [style, mode, speechEnd, latency] of [
+        ['quick', 'instant', 0, 740],
+        ['standard', 'instant', 0, 840],
+        ['quick', 'balanced', 0, 1100],
+        ['standard', 'instant', undefined, 1200],
+    ]) {
+        time = 10;
+        const record = metrics.start('groq', 'fixture', 'text', speechEnd);
+        Object.assign(record, { style, mode });
+        time = latency;
+        metrics.mark(record.requestId, 'firstOpeningRendered');
+        metrics.finish(record.requestId, 'COMPLETED');
+    }
+    const summary = metrics.snapshot();
+    assert.deepEqual(summary.quickOpening, { count: 1, medianMs: 740 });
+    assert.deepEqual(summary.instantOpening, { count: 1, medianMs: 840 });
+    assert.match(metrics.export('csv'), /speechToOpeningMs/);
+});
+
+test('Quick Answer IPC limits pins and validates answer references', () => {
+    assert.doesNotThrow(() => validate('quick-answer:pin', ['Use Python']));
+    assert.throws(() => validate('quick-answer:pin', ['x'.repeat(501)]));
+    assert.throws(() => validate('quick-answer:deepen', ['invalid']));
+});

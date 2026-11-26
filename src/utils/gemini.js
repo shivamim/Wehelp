@@ -896,8 +896,22 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     });
     ipcMain.handle('performance:snapshot', () => monitor.snapshot());
     ipcMain.handle('performance:export', (_event, format) => monitor.export(format));
-    ipcMain.handle('performance:rendered', (_event, id) => {
-        monitor.mark(id, 'firstRendered');
+    ipcMain.handle('performance:rendered', (_event, id, openingSentence) => {
+        monitor.mark(id, openingSentence ? 'firstOpeningRendered' : 'firstRendered');
+    });
+    ipcMain.handle('quick-answer:pin', (_event, context) => {
+        if (currentProviderMode !== 'byok' || !generation.requests.sessionId || getRuntimeConfig().responseStyle !== 'quick')
+            return { success: false, error: 'Start a Quick Answer session to pin context.' };
+        generation.pinnedContext = context.trim();
+        return { success: true };
+    });
+    ipcMain.handle('quick-answer:deepen', async (_event, id) => {
+        if (currentProviderMode !== 'byok') return { success: false, error: 'Go deeper requires Quick Answer.' };
+        try {
+            return await generation.deepen(id);
+        } catch (error) {
+            return { success: false, error: error.message };
+        }
     });
     ipcMain.handle('performance:audio', (_event, values) => {
         for (const key of ['audioBacklog', 'audioTransportMs', 'audioCaptureInitMs'])

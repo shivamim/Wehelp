@@ -171,10 +171,19 @@ export class EngineSettings extends LitElement {
                     ['local', 'Local AI'],
                 ])}
                 ${this.select('Response style', 'responseStyle', [
+                    ['quick', 'Quick Answer'],
                     ['concise', 'Concise'],
                     ['standard', 'Standard'],
                     ['detailed', 'Detailed'],
                 ])}
+                ${
+                    this.config.responseStyle === 'quick'
+                        ? html`<p>
+                              For spoken Quick Answers, choose Groq Whisper transcription and a Groq or Gemini text response provider. Use Instant
+                              mode to compare Quick Answer with Standard in Performance.
+                          </p>`
+                        : ''
+                }
                 ${this.model('Gemini response and vision', 'geminiChatModel', 'gemini', 'text')}
                 ${this.model('Groq response', 'groqModel', 'groq', 'text')} ${this.model('Groq vision', 'groqImageModel', 'groq', 'vision')}
                 ${this.model('Gemini native voice', 'geminiLiveModel', 'gemini', 'live', false)}
@@ -283,6 +292,9 @@ export class EngineSettings extends LitElement {
                     <dd>${ms(m.lastLatencyMs)}</dd>
                     <dt>Estimated speech end to visible text (Groq transcription)</dt>
                     <dd>${ms(m.lastSpeechToVisibleMs)} last · ${ms(m.speechToVisibleP95Ms)} P95 · ${m.speechSamples || 0} samples</dd>
+                    <dt>Speech to estimated opening sentence in Instant mode (median)</dt>
+                    <dd>Quick Answer ${ms(m.quickOpening?.medianMs)} · ${m.quickOpening?.count || 0} samples</dd>
+                    <dd>Standard style ${ms(m.instantOpening?.medianMs)} · ${m.instantOpening?.count || 0} samples</dd>
                     <dt>Last speech detection / transcription</dt>
                     <dd>${ms(m.lastEndpointMs)} / ${ms(m.lastTranscriptionMs)}</dd>
                     <dt>Average / P50</dt>
