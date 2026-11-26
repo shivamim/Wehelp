@@ -38,7 +38,7 @@ test('worklet emits all chunk profiles in PCM with clipping protection', () => {
         assert.equal(p.outstanding, 0);
     }
 });
-test('AudioSession cleanup stops every track, node, port and context', async () => {
+test('AudioSession closes processing resources and can preserve tracks for pause', async () => {
     const source = fs.readFileSync('src/audio/audio-session.js', 'utf8');
     const AudioSession = (await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'))).AudioSession;
     const closed = { tracks: 0, nodes: 0, ports: 0, sources: 0, contexts: 0 };
@@ -50,8 +50,13 @@ test('AudioSession cleanup stops every track, node, port and context', async () 
             node: { port: { close: () => closed.ports++ }, disconnect: () => closed.nodes++ },
             source: { disconnect: () => closed.sources++ },
         });
+    await session.stop({ keepStreams: true });
+    assert.deepEqual(closed, { tracks: 0, nodes: 2, ports: 2, sources: 2, contexts: 2 });
+    assert.equal(session.resources.size, 0);
+
+    session.resources.add({ stream: { getTracks: () => [{ stop: () => closed.tracks++ }] } });
     await session.stop();
     await session.stop();
-    assert.deepEqual(closed, { tracks: 2, nodes: 2, ports: 2, sources: 2, contexts: 2 });
+    assert.equal(closed.tracks, 1);
     assert.equal(session.resources.size, 0);
 });

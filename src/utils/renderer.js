@@ -205,6 +205,14 @@ ipcRenderer.on('voice-audio', (_event, pcm) => voiceOutput.push(pcm));
 ipcRenderer.on('voice-interrupted', () => voiceOutput.clear());
 let captureEpoch = 0;
 let captureActive = false;
+let audioPaused = false;
+let audioInputs = [];
+let nativeAudio = false;
+
+async function addAudioInput(stream, source, chunkMs) {
+    audioInputs.push({ stream, source, chunkMs });
+    await audioSession.add(stream, source, chunkMs);
+}
 const audioSession = new AudioSession({
     send: chunk => ipcRenderer.invoke('audio:chunk', chunk),
     onError: error => {
@@ -242,7 +250,9 @@ async function startCapture(_interval = 5, imageQuality = 'medium') {
         if (mode !== 'mic_only') {
             if (isMacOS) {
                 const result = await ipcRenderer.invoke('start-macos-audio');
+                if (epoch !== captureEpoch) return false;
                 if (!result.success) throw new Error(result.error);
+                nativeAudio = true;
             } else {
                 const stream = await authorizeScreen(true);
                 if (epoch !== captureEpoch) {
@@ -252,9 +262,10 @@ async function startCapture(_interval = 5, imageQuality = 'medium') {
                 mediaStream = stream;
                 if (!stream.getAudioTracks().length)
                     throw new Error('No system audio was shared. Select microphone mode or share a source with audio.');
-                await audioSession.add(stream, 'system', config.audioChunkMs || 100);
+                await addAudioInput(stream, 'system', config.audioChunkMs || 100);
             }
         }
+        if (epoch !== captureEpoch) return false;
         if (mode === 'mic_only' || mode === 'both') {
             captureTarget = 'microphone';
             const stream = await navigator.mediaDevices.getUserMedia({
@@ -272,7 +283,7 @@ async function startCapture(_interval = 5, imageQuality = 'medium') {
                 stream.getTracks().forEach(t => t.stop());
                 return false;
             }
-            await audioSession.add(stream, 'mic', config.audioChunkMs || 100);
+            await addAudioInput(stream, 'mic', config.audioChunkMs || 100);
         }
         if (epoch !== captureEpoch) return false;
         await ipcRenderer.invoke('capture:state', { active: true });
@@ -280,6 +291,7 @@ async function startCapture(_interval = 5, imageQuality = 'medium') {
         cheatingDaddy.setStatus('Capturing audio — Stop Session to end');
         return true;
     } catch (error) {
+        if (epoch !== captureEpoch) return false;
         await stopCapture();
         await ipcRenderer.invoke('close-session');
         const denied =
@@ -509,9 +521,68 @@ async function captureManualScreenshot(imageQuality = null) {
 // Expose functions to global scope for external access
 window.captureManualScreenshot = captureManualScreenshot;
 
+async function pauseCapture() {
+    if (!captureActive || audioPaused || (!audioInputs.length && !nativeAudio)) return false;
+    const epoch = captureEpoch;
+    audioPaused = true;
+    for (const { stream } of audioInputs) {
+        stream.getAudioTracks().forEach(track => (track.enabled = false));
+    }
+    await audioSession.stop({ keepStreams: true });
+    if (epoch !== captureEpoch) return false;
+    if (nativeAudio) await ipcRenderer.invoke('stop-macos-audio');
+    if (epoch !== captureEpoch) return false;
+    await ipcRenderer.invoke('capture:state', { active: false });
+    await ipcRenderer.invoke('pause-audio').catch(error => console.warn('Could not notify the audio provider of pause:', error));
+    if (epoch !== captureEpoch) return false;
+    cheatingDaddy.setStatus('Audio paused');
+    return true;
+}
+
+async function resumeCapture() {
+    if (!captureActive || !audioPaused) return false;
+    const epoch = captureEpoch;
+    try {
+        for (const { stream, source, chunkMs } of audioInputs) {
+            const tracks = stream.getAudioTracks();
+            if (!tracks.length || tracks.some(track => track.readyState !== 'live')) {
+                throw new Error('Audio sharing ended. Stop this session and start a new one to share audio again.');
+            }
+            tracks.forEach(track => (track.enabled = true));
+            await audioSession.add(stream, source, chunkMs);
+            if (epoch !== captureEpoch) return false;
+        }
+        if (nativeAudio) {
+            const result = await ipcRenderer.invoke('start-macos-audio');
+            if (epoch !== captureEpoch) return false;
+            if (!result.success) throw new Error(result.error || 'Could not restart system audio');
+        }
+        await ipcRenderer.invoke('capture:state', { active: true });
+        if (epoch !== captureEpoch) return false;
+        audioPaused = false;
+        cheatingDaddy.setStatus('Capturing audio — Stop Session to end');
+        return true;
+    } catch (error) {
+        if (epoch !== captureEpoch) return false;
+        for (const { stream } of audioInputs) {
+            stream.getAudioTracks().forEach(track => (track.enabled = false));
+        }
+        await audioSession.stop({ keepStreams: true });
+        if (epoch !== captureEpoch) return false;
+        cheatingDaddy.setStatus('Could not resume audio: ' + error.message);
+        return false;
+    }
+}
+
 async function stopCapture() {
     captureEpoch++;
     captureActive = false;
+    audioPaused = false;
+    nativeAudio = false;
+    for (const { stream } of audioInputs) {
+        stream.getTracks().forEach(track => track.stop());
+    }
+    audioInputs = [];
     ipcRenderer.invoke('capture:state', { active: false }).catch(() => {});
     const stoppingAudio = audioSession.stop();
     const stoppingVoice = voiceOutput.stop();
@@ -912,11 +983,8 @@ const cheatingDaddy = {
     cancelLocalInitialization,
     startCapture,
     stopCapture,
-    pauseCapture: async () => {
-        await stopCapture();
-        await ipcRenderer.invoke('pause-audio');
-        cheatingDaddy.setStatus('Audio paused');
-    },
+    pauseCapture,
+    resumeCapture,
     sendTextMessage,
     handleShortcut,
 
